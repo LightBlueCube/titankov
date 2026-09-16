@@ -1,4 +1,93 @@
 {
-    "Name": "titankov",
-    "LoadPriority": 102
+	"Name": "titankov",
+	"LoadPriority": 102,
+	"Scripts": [
+
+
+		// util libs //
+
+		{
+			"Path": "tcputil/lib/convar_util.gnut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/lib/entity_util.gnut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/lib/better_respawn_point.gnut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/lib/hudmsg_priority.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "HudMessagePriority_Init"
+			}
+		},
+		{
+			"Path": "tcputil/lib/rui_queue.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "RUIQueue_Init"
+			}
+		},
+		{
+			"Path": "tcputil/lib/votecommand.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "VoteCommand_Init"
+			}
+		},
+		{
+			"Path": "tcputil/lib/chatcommand.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "ChatCommand_Init"
+			}
+		},
+
+		// util feats //
+
+		{
+			"Path": "tcputil/feat/random_map.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/anti_afk.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/teamshuffle.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/night_sky.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/colorful_chat.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/auto_shutdown.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/anti_insult.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/disable_aimassist.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/dev_tarck_usage.nut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tcputil/feat/vote_skipmatch.nut",
+			"RunOn": "SERVER && MP"
+		},
+	]
 }

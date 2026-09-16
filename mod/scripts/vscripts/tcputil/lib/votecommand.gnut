@@ -1,0 +1,269 @@
+global function VoteCommand_Init
+global function AddCustomVoteEndCode
+global function StartNewVoteEvent
+global function EndVoteEvent
+global function HasVoteEvent
+global function GetVoteEvent
+global function Vote_ShowList
+global function Vote_ShouldEarlyEnd
+global function Vote_EasyReleaseFunc
+global function Vote_EasyVoteFunc
+global function Vote_EasyEndFunc
+
+global table<string, int> eVoteEndCode =
+{
+	invalid = 0,
+	timeout = 1,
+	complete = 2
+}
+
+// get started
+// new a VoteEventStruct and setup it
+// use function StartNewVoteEvent to start ur own vote event
+
+global struct VoteEventStruct
+{
+	// on vote release, can use this function to show some stupid text
+	// we have a simple implementation by use this function: Vote_EasyReleaseFunc
+	void functionref( VoteEventStruct ) voteReleaseFunc
+
+	// on player voted by use command (can custom ur own vote command, we have a simple example at tcputil/vote_skipmatch.nut SkipMatchOnVote)
+	// we have a simple implementation by use this function: Vote_EasyVoteFunc
+
+	// here is some information u need if u want to made a own function
+	// bool onVoteFunc( voteStruct, votePlayer, voteArgs )
+	// return true will hided the message which send by player, return false will send it by normal
+	bool functionref( VoteEventStruct, entity, string ) onVoteFunc
+
+	// on end vote (time out or got enough number of vote)
+	// we have a simple implementation by use this function: Vote_EasyEndFunc
+
+	// VoteEventStruct.callbackFunc is called by this function
+	void functionref( VoteEventStruct ) voteEndFunc
+
+	// do something on vote passed or not passed
+	// called by VoteEventStruct.voteEndFunc
+	void functionref( bool ) callbackFunc
+
+	//================================================================//
+
+	string voteName = "新投票"
+
+	// function Time() will return current time, add the time u want on current time to setup vote end time
+	float endTime = 0.0
+
+	array<string> hasVotedPlayers = []
+
+	// to tell the reason for end this vote event, use function AddCustomVoteEndCode to made ur own endcode
+	int endCode = 0	// eVoteEndCode.invalid
+	int voteYesCount = 0
+	int voteNoCount = 0
+
+	// vote id, will be override at StartNewVoteEvent
+	// StartNewVoteEvent will return the id, u can get the event struct by using id on function GetVoteEvent
+	int id = 0
+
+	// if u wanna share or just save other shitting stuff, use this, require untyped
+	table s
+}
+
+struct{
+	table<int,VoteEventStruct> events
+}file
+
+const string NO_VOTE_TEXT = "当前无投票"
+
+void function VoteCommand_Init()
+{
+	AddClientCommandCallback( "vote", VoteCommand )
+	AddChatCommandCallback( "!vote", VoteCommand )
+	AddChatCommandCallback( "！vote", VoteCommand )
+}
+
+bool function VoteCommand( entity player, array<string> args )
+{
+	if( args.len() == 0 )
+	{
+		Vote_ShowList( player )
+		return true
+	}
+	if( args.len() <= 1 )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m指令缺少参数！", false, false )
+		Vote_ShowList( player )
+		return true
+	}
+
+	int id = args[0].tointeger()
+	if( !( id in file.events ) )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m无效投票ID", false, false )
+		Vote_ShowList( player )
+		return true
+	}
+	if( ![ "y", "n" ].contains( args[1] ) )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m无效投票选项，请注意大小写！", false, false )
+		Vote_ShowList( player )
+		return true
+	}
+	if( !HasVoteEvent( id ) )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m无效投票ID", false, false )
+		Vote_ShowList( player )
+		return true
+	}
+	return GetVoteEvent( id ).onVoteFunc( GetVoteEvent( id ), player, args[1] )
+}
+
+void function Vote_ShowList( entity player )
+{
+	if( file.events.len() == 0 )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m当前无投票", false, false )
+		return
+	}
+
+	Chat_ServerPrivateMessage( player, "\x1b[92m==== 当前活跃投票 ====", false, false )
+	foreach( k, v in file.events )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[32m投票ID: \x1b[92m"+ k +"\x1b[32m | 投票描述: \x1b[92m"+ v.voteName, false, false )
+	}
+	Chat_ServerPrivateMessage( player, "\x1b[32m输入 \x1b[36m!vote 投票ID y \x1b[32m投同意票\n输入 \x1b[36m!vote 投票ID n \x1b[32m投反对票", false, false )
+}
+
+int function StartNewVoteEvent( VoteEventStruct event )
+{
+	event.id = GetValidEventId()
+	file.events[ event.id ] <- event
+	event.voteReleaseFunc( event )
+	thread WaitForVoteEnd( event )
+	return event.id
+}
+
+int function GetValidEventId()
+{
+	int i = 1
+	while( i in file.events )
+		i++
+	return i
+}
+
+void function WaitForVoteEnd( VoteEventStruct event )
+{
+	while( Time() < event.endTime )
+		WaitFrame()
+	if( event.endCode == eVoteEndCode.invalid )
+		event.endCode = eVoteEndCode.timeout
+	event.voteEndFunc( event )
+	delete file.events[ event.id ]
+}
+
+void function EndVoteEvent( VoteEventStruct event, int endCode )
+{
+	event.endCode = endCode
+	event.endTime = Time()
+}
+
+bool function HasVoteEvent( int id )
+{
+	return id in file.events
+}
+
+VoteEventStruct function GetVoteEvent( int id )
+{
+	return file.events[ id ]
+}
+
+void function AddCustomVoteEndCode( string codeName )
+{
+	int id = FindValidIdForEndCode( 0 )
+
+	printt( codeName +" id:"+ id )
+
+	eVoteEndCode[ codeName ] <- id
+}
+
+int function FindValidIdForEndCode( int id )
+{
+	foreach( k, v in eVoteEndCode )
+	{
+		if( v != id )
+			continue
+		return FindValidIdForEndCode( ++id )
+	}
+	return id
+}
+
+// vote easy implementation functions //
+
+void function Vote_EasyReleaseFunc( VoteEventStruct voteEvent )
+{
+	foreach( ent in GetPlayerArray() )
+		Chat_ServerPrivateMessage( ent, "\n\x1b[32m一个新的投票：\x1b[36m"+ voteEvent.voteName +"\x1b[32m 已被发布", false, false )
+	foreach( ent in GetPlayerArray() )
+		Chat_ServerPrivateMessage( ent, "\x1b[32m输入 \x1b[36m!vote "+ voteEvent.id +" y \x1b[32m投同意票\n输入 \x1b[36m!vote "+ voteEvent.id +" n \x1b[32m投反对票", false, false )
+}
+
+bool function Vote_EasyVoteFunc( VoteEventStruct voteEvent, entity player, string vote )
+{
+	if( voteEvent.hasVotedPlayers.contains( player.GetUID() ) )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m你已经投过票了！", false, false )
+		return true
+	}
+	if( ![ "y", "n" ].contains( vote ) )
+	{
+		Chat_ServerPrivateMessage( player, "\x1b[31m无效投票选项，请注意大小写！", false, false )
+		Vote_ShowList( player )
+		return true
+	}
+	voteEvent.hasVotedPlayers.append( player.GetUID() )
+	if( vote == "y" )
+		voteEvent.voteYesCount += 1
+	else
+		voteEvent.voteNoCount += 1
+
+	foreach( ent in GetPlayerArray() )
+		Chat_ServerPrivateMessage( ent, "\n\x1b[32m名为 \x1b[36m"+ voteEvent.voteName +"\x1b[32m 的投票目前票数为\n\x1b[36m同意票 "+ voteEvent.voteYesCount +" / "+ voteEvent.voteNoCount +" 反对票", false, false )
+	if( Vote_ShouldEarlyEnd( voteEvent ) )
+	{
+		EndVoteEvent( voteEvent, eVoteEndCode.complete )
+		return true
+	}
+
+	foreach( ent in GetPlayerArray() )
+		Chat_ServerPrivateMessage( ent, "\x1b[32m输入 \x1b[36m!vote "+ voteEvent.id +" y \x1b[32m投同意票\n输入 \x1b[36m!vote "+ voteEvent.id +" n \x1b[32m投反对票", false, false )
+	return true
+}
+
+void function Vote_EasyEndFunc( VoteEventStruct voteEvent )
+{
+	if( voteEvent.endCode == eVoteEndCode.timeout )
+		foreach( ent in GetPlayerArray() )
+			Chat_ServerPrivateMessage( ent, "\n\x1b[32m名为 \x1b[36m"+ voteEvent.voteName +"\x1b[32m 的投票目前票数为\n\x1b[36m同意票 "+ voteEvent.voteYesCount +" / "+ voteEvent.voteNoCount +" 反对票", false, false )
+	string voteEndText = "\x1b[33m此投票已结束！投票结果为："
+	int yes = voteEvent.voteYesCount
+	int no = voteEvent.voteNoCount
+	if( yes == no )
+		voteEndText += "\x1b[36m票数持平，按照反对票居多处理"
+	else if( yes > no )
+		voteEndText += "\x1b[36m同意票居多"
+	else
+		voteEndText += "\x1b[36m反对票居多"
+	foreach( ent in GetPlayerArray() )
+		Chat_ServerPrivateMessage( ent, voteEndText, false, false )
+
+	voteEvent.callbackFunc( yes > no )
+}
+
+bool function Vote_ShouldEarlyEnd( VoteEventStruct voteEvent )
+{
+	if( voteEvent.voteYesCount > float( GetPlayerArray().len() ) / 2 )
+		return true
+	if( voteEvent.voteNoCount >= float( GetPlayerArray().len() ) / 2 )
+		return true
+	if( voteEvent.voteYesCount + voteEvent.voteNoCount == GetPlayerArray().len() )
+		return true
+	return false
+}
