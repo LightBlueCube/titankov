@@ -33,6 +33,20 @@
 			}
 		},
 		{
+			"Path": "tui/tui_ecam.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TuiEcam_Init"
+			}
+		},
+		{
+			"Path": "tui/tui_ecam_test.nut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TuiEcamTest_Init"
+			}
+		},
+		{
 			"Path": "tcputil/lib/votecommand.gnut",
 			"RunOn": "SERVER && MP",
 			"ServerCallback": {

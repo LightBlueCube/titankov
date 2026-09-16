@@ -1,0 +1,736 @@
+global function TuiEcam_Init
+
+global function ECAM_Insert
+global function ECAM_SetText
+global function ECAM_SetSeverity
+global function ECAM_Complete
+global function ECAM_Reopen
+global function ECAM_Collapse
+global function ECAM_Delete
+global function ECAM_Clear
+
+// ECAM checklist lib
+// usage:
+//   int fire = ECAM_Insert( player, 0, "ENG 1 FIRE", eEcamSeverity.WARNING )
+//   int step = ECAM_Insert( player, fire, "FIRE SWITCH", eEcamSeverity.INFO, "PULL" )
+//   ECAM_Complete( player, step )
+//   ECAM_Complete( player, fire, true )  // children complete too, auto collapse
+
+global enum eEcamSeverity
+{
+	INFO = 0
+	OK = 1
+	ACTION = 2
+	CAUTION = 3
+	WARNING = 4
+}
+
+const int ECAM_COLS = 60
+const int ECAM_ROWS = 34
+const int ECAM_FONT_SIZE = 24
+const float ECAM_POS_X = 0.3
+const float ECAM_POS_Y = 0.26
+const int ECAM_PRIORITY = 50
+
+const int ECAM_INDENT_COLS = 2
+const int ECAM_CONTENT_COLS = 58
+
+// palette sampled from iniBuilds A350 ECAM textures (Data/Textures/ECAM)
+const string ECAM_SGR_RESET = "\x1b[0m"
+const string ECAM_SGR_PANEL_BG = "\x1b[48:6:60:74:84:150m"
+const string ECAM_SGR_TITLE = "\x1b[1m\x1b[38;2;214;228;229m\x1b[48:6:95:110:118:220m"
+const string ECAM_SGR_WARN_FG = "\x1b[1m\x1b[38;2;214;228;229m"
+const string ECAM_SGR_WARN_BG = "\x1b[48:6:255:69:69:255m"
+const string ECAM_SGR_CAUTION = "\x1b[1m\x1b[38;2;255;145;46m"
+const string ECAM_SGR_INFO = "\x1b[38;2;198;217;219m"
+const string ECAM_SGR_ACTION = "\x1b[38;2;57;189;214m"
+const string ECAM_SGR_OK = "\x1b[38;2;39;216;26m"
+const string ECAM_SGR_DIM = "\x1b[38;2;119;119;119m"
+
+struct EcamNode
+{
+	int id = 0
+	int parentId = 0
+	string text = ""
+	string target = ""
+	int severity = 0
+	bool done = false
+	bool doneByParent = false
+	bool collapsed = false
+	int seq = 0
+	int doneSeq = 0
+	array<int> children = []
+}
+
+struct EcamRowSeg
+{
+	string text = ""
+	string fg = ""
+}
+
+struct EcamRow
+{
+	array<EcamRowSeg> segs = []
+	int width = 0
+	bool warn = false
+	bool title = false
+}
+
+struct EcamPlayerState
+{
+	entity player
+	int tuiIndex = -1
+	int nextId = 1
+	int seqCounter = 0
+	int doneCounter = 0
+	table<int, EcamNode> nodes = {}
+	array<int> roots = []
+	bool dirty = false
+}
+
+table<string, EcamPlayerState> ecamPlayerStates = {}
+
+void function TuiEcam_Init()
+{
+	AddCallback_OnClientConnected( EcamOnClientConnected )
+	AddCallback_OnClientDisconnected( EcamOnClientDisconnected )
+	AddCallback_OnPlayerRespawned( EcamOnPlayerRespawned )
+}
+
+void function EcamOnClientConnected( entity player )
+{
+	EcamPlayerState state = { ... }
+	state.player = player
+	state.tuiIndex = NSCreateTUI( player, ECAM_COLS, ECAM_ROWS, ECAM_FONT_SIZE, ECAM_POS_X, ECAM_POS_Y, ECAM_PRIORITY )
+	ecamPlayerStates[ player.GetUID() ] <- state
+
+	thread EcamThink( player )
+}
+
+void function EcamOnClientDisconnected( entity player )
+{
+	string uid = player.GetUID()
+	if ( uid in ecamPlayerStates )
+		delete ecamPlayerStates[ uid ]
+}
+
+void function EcamOnPlayerRespawned( entity player )
+{
+	thread EcamLifeSentry( player )
+}
+
+void function EcamLifeSentry( entity player )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+
+	OnThreadEnd(
+		function() : ( player )
+		{
+			if ( !IsValid( player ) )
+				return
+
+			string uid = player.GetUID()
+			if ( uid in ecamPlayerStates )
+				EcamClearState( ecamPlayerStates[ uid ] )
+		}
+	)
+
+	WaitForever()
+}
+
+void function EcamThink( entity player )
+{
+	player.EndSignal( "OnDestroy" )
+
+	while ( true )
+	{
+		string uid = player.GetUID()
+		if ( uid in ecamPlayerStates )
+		{
+			EcamPlayerState state = ecamPlayerStates[ uid ]
+			if ( state.dirty )
+			{
+				state.dirty = false
+				NSSendTUI( player, state.tuiIndex, EcamRenderFrame( state ) )
+			}
+		}
+		WaitFrame()
+	}
+}
+
+int function ECAM_Insert( entity player, int parentId, string text, int severity = eEcamSeverity.INFO, string target = "" )
+{
+	if ( severity < eEcamSeverity.INFO || severity > eEcamSeverity.WARNING )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+
+	if ( parentId != 0 )
+	{
+		EcamNode parentNode = EcamGetNode( state, parentId )
+		if ( parentNode.done )
+			unreachable
+	}
+
+	EcamNode node = { ... }
+	node.id = state.nextId
+	node.parentId = parentId
+	node.text = text
+	node.target = target
+	node.severity = severity
+	state.nextId++
+	state.seqCounter++
+	node.seq = state.seqCounter
+	state.nodes[ node.id ] <- node
+
+	if ( parentId == 0 )
+		state.roots.append( node.id )
+	else
+		state.nodes[ parentId ].children.append( node.id )
+
+	state.dirty = true
+	return node.id
+}
+
+void function ECAM_SetText( entity player, int index, string text )
+{
+	if ( index == 0 )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+	node.text = text
+	state.dirty = true
+}
+
+void function ECAM_SetSeverity( entity player, int index, int severity )
+{
+	if ( index == 0 )
+		unreachable
+	if ( severity < eEcamSeverity.INFO || severity > eEcamSeverity.WARNING )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+	node.severity = severity
+	state.dirty = true
+}
+
+void function ECAM_Complete( entity player, int index, bool autoCollapse = true )
+{
+	if ( index == 0 )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+	if ( node.done )
+		unreachable
+
+	EcamMarkDone( state, node )
+	if ( autoCollapse )
+		node.collapsed = true
+	state.dirty = true
+}
+
+void function ECAM_Reopen( entity player, int index )
+{
+	if ( index == 0 )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+	if ( !node.done )
+		unreachable
+
+	EcamReopenNode( state, node )
+	node.collapsed = false
+	state.dirty = true
+}
+
+void function ECAM_Collapse( entity player, int index, bool collapsed = true )
+{
+	if ( index == 0 )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+	node.collapsed = collapsed
+	state.dirty = true
+}
+
+void function ECAM_Delete( entity player, int index )
+{
+	if ( index == 0 )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+	EcamNode node = EcamGetNode( state, index )
+
+	if ( node.parentId == 0 )
+		state.roots.removebyvalue( index )
+	else
+		state.nodes[ node.parentId ].children.removebyvalue( index )
+
+	EcamDeleteSubtree( state, node )
+	state.dirty = true
+}
+
+void function ECAM_Clear( entity player )
+{
+	string uid = player.GetUID()
+	if ( !( uid in ecamPlayerStates ) )
+		return
+
+	EcamClearState( ecamPlayerStates[ uid ] )
+}
+
+EcamPlayerState function EcamGetState( entity player )
+{
+	string uid = player.GetUID()
+	if ( uid in ecamPlayerStates )
+		return ecamPlayerStates[ uid ]
+
+	unreachable
+}
+
+EcamNode function EcamGetNode( EcamPlayerState state, int index )
+{
+	if ( index in state.nodes )
+		return state.nodes[ index ]
+
+	unreachable
+}
+
+void function EcamClearState( EcamPlayerState state )
+{
+	state.nodes = {}
+	state.roots = []
+	state.dirty = true
+}
+
+void function EcamMarkDone( EcamPlayerState state, EcamNode node )
+{
+	node.done = true
+	state.doneCounter++
+	node.doneSeq = state.doneCounter
+
+	foreach ( int childId in node.children )
+	{
+		EcamNode child = state.nodes[ childId ]
+		if ( !child.done )
+		{
+			child.doneByParent = true
+			EcamMarkDone( state, child )
+		}
+	}
+}
+
+void function EcamReopenNode( EcamPlayerState state, EcamNode node )
+{
+	node.done = false
+	node.doneByParent = false
+	node.doneSeq = 0
+
+	foreach ( int childId in node.children )
+	{
+		EcamNode child = state.nodes[ childId ]
+		if ( child.done && child.doneByParent )
+			EcamReopenNode( state, child )
+	}
+}
+
+void function EcamDeleteSubtree( EcamPlayerState state, EcamNode node )
+{
+	foreach ( int childId in node.children )
+		EcamDeleteSubtree( state, state.nodes[ childId ] )
+
+	delete state.nodes[ node.id ]
+}
+
+array<int> function EcamSortIds( EcamPlayerState state, array<int> ids )
+{
+	array<int> sorted = []
+	foreach ( int id in ids )
+	{
+		int insertAt = sorted.len()
+		for ( int i = 0; i < sorted.len(); i++ )
+		{
+			if ( EcamNodeOrder( state, id, sorted[ i ] ) )
+			{
+				insertAt = i
+				break
+			}
+		}
+		sorted.insert( insertAt, id )
+	}
+	return sorted
+}
+
+bool function EcamNodeOrder( EcamPlayerState state, int aId, int bId )
+{
+	EcamNode a = state.nodes[ aId ]
+	EcamNode b = state.nodes[ bId ]
+
+	if ( a.done != b.done )
+		return !a.done
+	if ( a.done )
+		return a.doneSeq <= b.doneSeq
+	if ( a.severity != b.severity )
+		return a.severity > b.severity
+	return a.seq <= b.seq
+}
+
+string function EcamRenderFrame( EcamPlayerState state )
+{
+	if ( state.roots.len() == 0 )
+		return ""
+
+	array<EcamRow> rows = []
+
+	EcamRow titleRow = { ... }
+	titleRow.title = true
+	rows.append( titleRow )
+
+	foreach ( int id in EcamSortIds( state, state.roots ) )
+		EcamLayoutNode( state, id, 0, rows )
+
+	if ( rows.len() > ECAM_ROWS )
+	{
+		int hiddenCount = rows.len() - ( ECAM_ROWS - 1 )
+		while ( rows.len() > ECAM_ROWS - 1 )
+			rows.pop()
+
+		EcamRow moreRow = { ... }
+		string moreText = "... " + format( "+%d MORE", hiddenCount )
+		EcamAppendSeg( moreRow, moreText, ECAM_SGR_CAUTION )
+		moreRow.width = EcamStrWidth( moreText )
+		rows.append( moreRow )
+	}
+
+	string frame = ""
+	for ( int i = 0; i < rows.len(); i++ )
+	{
+		if ( i > 0 )
+			frame += "\n"
+		frame += EcamComposeRow( rows[ i ] )
+	}
+	return frame
+}
+
+void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<EcamRow> rows )
+{
+	EcamNode node = state.nodes[ id ]
+
+	int indent = depth * ECAM_INDENT_COLS
+	int avail = ECAM_CONTENT_COLS - indent - 2
+	if ( avail < 8 )
+		avail = 8
+
+	bool hasChildren = node.children.len() > 0
+	bool hasCount = hasChildren && node.collapsed
+	string countText = hasCount ? format( " (%d)", node.children.len() ) : ""
+	int countWidth = hasCount ? EcamStrWidth( countText ) : 0
+
+	array<string> lines = EcamWrapText( node.text, avail )
+	if ( lines.len() == 0 )
+		lines.append( "" )
+
+	bool alignedTarget = false
+	if ( node.target != "" )
+	{
+		if ( lines.len() == 1 )
+		{
+			int used = indent + 2 + EcamStrWidth( lines[ 0 ] ) + countWidth
+			if ( used + 2 + EcamStrWidth( node.target ) <= ECAM_CONTENT_COLS )
+				alignedTarget = true
+		}
+		if ( !alignedTarget )
+		{
+			string merged = node.text
+			if ( merged != "" )
+				merged += "  "
+			merged += node.target
+			lines = EcamWrapText( merged, avail )
+			if ( lines.len() == 0 )
+				lines.append( "" )
+		}
+	}
+
+	bool warn = !node.done && node.severity == eEcamSeverity.WARNING
+	string fg = warn ? "" : EcamNodeFg( node )
+	string targetFg = node.done ? ECAM_SGR_OK : fg
+
+	for ( int i = 0; i < lines.len(); i++ )
+	{
+		EcamRow row = { ... }
+		row.warn = warn
+		string line = lines[ i ]
+		int width = indent + 2 + EcamStrWidth( line )
+
+		if ( i == 0 )
+		{
+			EcamAppendSeg( row, EcamSpaces( indent ), "" )
+			string marker = "  "
+			if ( hasChildren )
+				marker = node.collapsed ? "+ " : "- "
+			EcamAppendSeg( row, marker, fg )
+			EcamAppendSeg( row, line, fg )
+		}
+		else
+		{
+			EcamAppendSeg( row, EcamSpaces( indent + 2 ), "" )
+			EcamAppendSeg( row, line, fg )
+		}
+
+		bool isLast = i == lines.len() - 1
+		if ( isLast && hasCount )
+		{
+			EcamAppendSeg( row, countText, warn ? "" : ECAM_SGR_DIM )
+			width += countWidth
+		}
+
+		if ( isLast && alignedTarget )
+		{
+			int targetWidth = EcamStrWidth( node.target )
+			int dots = ECAM_CONTENT_COLS - width - targetWidth - 2
+			if ( dots > 0 )
+				EcamAppendSeg( row, " " + EcamRepeat( ".", dots ) + " ", warn ? "" : fg )
+			else
+				EcamAppendSeg( row, "  ", warn ? "" : fg )
+			EcamAppendSeg( row, node.target, warn ? "" : targetFg )
+			width = ECAM_CONTENT_COLS
+		}
+
+		row.width = width
+		rows.append( row )
+	}
+
+	if ( !node.collapsed )
+	{
+		foreach ( int childId in EcamSortIds( state, node.children ) )
+			EcamLayoutNode( state, childId, depth + 1, rows )
+	}
+}
+
+string function EcamNodeFg( EcamNode node )
+{
+	if ( node.done )
+		return ECAM_SGR_OK
+	if ( node.severity == eEcamSeverity.WARNING )
+		return ECAM_SGR_WARN_FG
+	if ( node.severity == eEcamSeverity.CAUTION )
+		return ECAM_SGR_CAUTION
+	if ( node.severity == eEcamSeverity.OK )
+		return ECAM_SGR_OK
+	if ( node.severity == eEcamSeverity.ACTION )
+		return ECAM_SGR_ACTION
+	return ECAM_SGR_INFO
+}
+
+string function EcamComposeRow( EcamRow row )
+{
+	if ( row.title )
+		return ECAM_SGR_TITLE + " ECAM" + EcamSpaces( ECAM_CONTENT_COLS - 4 ) + " " + ECAM_SGR_RESET
+
+	if ( row.warn )
+	{
+		string text = ""
+		foreach ( EcamRowSeg seg in row.segs )
+			text += seg.text
+		int pad = ECAM_CONTENT_COLS - row.width
+		if ( pad < 0 )
+			pad = 0
+		return ECAM_SGR_WARN_FG + ECAM_SGR_WARN_BG + " " + text + EcamSpaces( pad ) + " " + ECAM_SGR_RESET
+	}
+
+	string out = ECAM_SGR_PANEL_BG + " "
+	foreach ( EcamRowSeg seg in row.segs )
+		out += seg.fg + seg.text
+	int pad = ECAM_CONTENT_COLS - row.width
+	if ( pad < 0 )
+		pad = 0
+	out += EcamSpaces( pad ) + " " + ECAM_SGR_RESET
+	return out
+}
+
+void function EcamAppendSeg( EcamRow row, string text, string fg )
+{
+	EcamRowSeg seg = { ... }
+	seg.text = text
+	seg.fg = fg
+	row.segs.append( seg )
+}
+
+array<string> function EcamWrapText( string text, int avail )
+{
+	array<string> lines = []
+
+	foreach ( string hard in split( text, "\n" ) )
+	{
+		string current = ""
+		foreach ( string word in split( hard, " " ) )
+		{
+			if ( word == "" )
+				continue
+
+			int wordWidth = EcamStrWidth( word )
+			if ( wordWidth > avail )
+			{
+				if ( current != "" )
+				{
+					lines.append( current )
+					current = ""
+				}
+
+				if ( EcamIsAscii( word ) )
+				{
+					int pos = 0
+					while ( pos < word.len() )
+					{
+						int rest = word.len() - pos
+						int take = avail < rest ? avail : rest
+						lines.append( word.slice( pos, pos + take ) )
+						pos += take
+					}
+				}
+				else
+				{
+					lines.append( word )
+				}
+				continue
+			}
+
+			if ( current == "" )
+			{
+				current = word
+			}
+			else if ( EcamStrWidth( current ) + 1 + wordWidth <= avail )
+			{
+				current += " " + word
+			}
+			else
+			{
+				lines.append( current )
+				current = word
+			}
+		}
+		lines.append( current )
+	}
+
+	return lines
+}
+
+int function EcamByteAt( string s, int i )
+{
+	return expect int( s[ i ] ) & 0xFF
+}
+
+int function EcamStrWidth( string s )
+{
+	int width = 0
+	int i = 0
+	while ( i < s.len() )
+	{
+		int byte = EcamByteAt( s, i )
+
+		if ( byte < 0x80 )
+		{
+			width += 1
+			i += 1
+			continue
+		}
+
+		if ( byte < 0xC0 )
+		{
+			i += 1
+			continue
+		}
+
+		int seqLen
+		int codepoint
+		if ( byte < 0xE0 )
+		{
+			seqLen = 2
+			codepoint = byte & 0x1F
+		}
+		else if ( byte < 0xF0 )
+		{
+			seqLen = 3
+			codepoint = byte & 0x0F
+		}
+		else
+		{
+			seqLen = 4
+			codepoint = byte & 0x07
+		}
+
+		for ( int k = 1; k < seqLen; k++ )
+		{
+			if ( i + k >= s.len() )
+				break
+			int cont = EcamByteAt( s, i + k )
+			if ( cont < 0x80 || cont >= 0xC0 )
+				break
+			codepoint = ( codepoint << 6 ) | ( cont & 0x3F )
+		}
+
+		width += EcamIsWideChar( codepoint ) ? 2 : 1
+		i += seqLen
+	}
+	return width
+}
+
+// mirrors the wide char ranges of the tui client renderer (ns_srvsidetui client/tui.cpp WIDE_RANGES)
+bool function EcamIsWideChar( int cp )
+{
+	if ( cp >= 0x1100 && cp <= 0x115F )
+		return true
+	if ( cp >= 0x2E80 && cp <= 0x303E )
+		return true
+	if ( cp >= 0x3041 && cp <= 0x33FF )
+		return true
+	if ( cp >= 0x3400 && cp <= 0x4DBF )
+		return true
+	if ( cp >= 0x4E00 && cp <= 0x9FFF )
+		return true
+	if ( cp >= 0xAC00 && cp <= 0xD7A3 )
+		return true
+	if ( cp >= 0xF900 && cp <= 0xFAFF )
+		return true
+	if ( cp >= 0xFE10 && cp <= 0xFE19 )
+		return true
+	if ( cp >= 0xFE30 && cp <= 0xFE6B )
+		return true
+	if ( cp >= 0xFF01 && cp <= 0xFF60 )
+		return true
+	if ( cp >= 0xFFE0 && cp <= 0xFFE6 )
+		return true
+	return false
+}
+
+bool function EcamIsAscii( string s )
+{
+	for ( int i = 0; i < s.len(); i++ )
+	{
+		if ( EcamByteAt( s, i ) >= 0x80 )
+			return false
+	}
+	return true
+}
+
+string function EcamSpaces( int count )
+{
+	return EcamRepeat( " ", count )
+}
+
+string function EcamRepeat( string ch, int count )
+{
+	if ( count <= 0 )
+		return ""
+
+	string s = ""
+	for ( int i = 0; i < count; i++ )
+		s += ch
+	return s
+}
