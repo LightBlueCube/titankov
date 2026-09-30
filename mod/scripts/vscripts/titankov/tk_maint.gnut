@@ -1,0 +1,398 @@
+global function TkMaint_Init
+
+// ECAM interaction + repair procedures
+// hold E: enter / leave | W/S: cursor | D: execute or unfold | A: fold | FIRE: abort repair
+// Executable rows are tagged by tk_fws (TkFws_HasAction); ECAM itself knows nothing about repairs.
+// While interacting the titan is frozen, cannot dash and has its weapons stowed (TK_SetMaintLock).
+// A small annunciator under the crosshair shows the meltdown countdown and repair progress.
+
+const int ANN_COLS = 44
+const int ANN_ROWS = 2
+const int ANN_FONT_SIZE = 26
+const float ANN_POS_X = 0.5
+const float ANN_POS_Y = 0.58
+const int ANN_PRIORITY = 52
+
+const float MAINT_HOLD_TIME = 0.4
+const float MAINT_TIME_RESET = 6.0
+const float MAINT_TIME_KIT = 4.0
+const float MAINT_TIME_SPARE = 8.0
+const float MAINT_MSG_TIME = 2.5
+const int MAINT_BAR_CELLS = 12
+
+const string ANN_SGR_RESET = "\x1b[0m"
+const string ANN_SGR_WARN = "\x1b[1m\x1b[38;2;214;228;229m\x1b[48:6:255:69:69:255m"
+const string ANN_SGR_INFO = "\x1b[38;2;57;189;214m\x1b[48:6:12:14:18:200m"
+
+struct MaintState
+{
+	int tuiIndex = -1
+	bool open = false
+	int lifeId = 0
+	int busyRepair = -1
+	int busyPart = -1
+	float busyStart = 0.0
+	float busyEnd = 0.0
+	string msg = ""
+	float msgEnd = 0.0
+	string lastFrame = ""
+}
+
+struct
+{
+	table<entity, MaintState> states
+} file
+
+void function TkMaint_Init()
+{
+	if ( GAMETYPE != TITAN_BRAWL )
+		return
+
+	RegisterSignal( "TkMaintAbort" )
+	RegisterSignal( "TkMaintStop" )
+	AddCallback_OnClientConnected( MaintOnClientConnected )
+	AddCallback_OnClientDisconnected( MaintOnClientDisconnected )
+}
+
+void function MaintOnClientConnected( entity player )
+{
+	MaintState state = { ... }
+	state.tuiIndex = NSCreateTUI( player, ANN_COLS, ANN_ROWS, ANN_FONT_SIZE, ANN_POS_X, ANN_POS_Y, ANN_PRIORITY )
+	file.states[ player ] <- state
+
+	AddPlayerHeldButtonEventCallback( player, IN_USE, MaintOnHoldUse, MAINT_HOLD_TIME )
+	AddButtonPressedPlayerInputCallback( player, IN_FORWARD, MaintOnUp )
+	AddButtonPressedPlayerInputCallback( player, IN_BACK, MaintOnDown )
+	AddButtonPressedPlayerInputCallback( player, IN_MOVELEFT, MaintOnFold )
+	AddButtonPressedPlayerInputCallback( player, IN_MOVERIGHT, MaintOnConfirm )
+	AddButtonPressedPlayerInputCallback( player, IN_ATTACK, MaintOnAttack )
+
+	thread MaintThink( player )
+}
+
+void function MaintOnClientDisconnected( entity player )
+{
+	player.Signal( "TkMaintStop" )
+	if ( player in file.states )
+		delete file.states[ player ]
+}
+
+void function MaintOnHoldUse( entity player )
+{
+	if ( !( player in file.states ) )
+		return
+
+	MaintState state = file.states[ player ]
+	if ( state.open )
+		MaintClose( player, state )
+	else if ( IsAlive( player ) && player.IsTitan() && TK_GetLifeId( player ) != 0 )
+		MaintOpen( player, state )
+}
+
+void function MaintOpen( entity player, MaintState state )
+{
+	state.open = true
+	state.lifeId = TK_GetLifeId( player )
+	TK_SetMaintLock( player, true )
+	ECAM_SetInteractive( player, true )
+}
+
+// leaving interaction also aborts a running repair (weapons come back out)
+void function MaintClose( entity player, MaintState state )
+{
+	player.Signal( "TkMaintAbort" )
+	state.open = false
+	if ( state.lifeId != 0 && TK_GetLifeId( player ) == state.lifeId )
+		TK_SetMaintLock( player, false )	// a finished life already dropped its effects
+	state.lifeId = 0
+	ECAM_SetInteractive( player, false )
+}
+
+// ---- input ----
+
+bool function MaintIsOpen( entity player )
+{
+	return ( player in file.states ) && file.states[ player ].open
+}
+
+void function MaintOnUp( entity player )
+{
+	if ( MaintIsOpen( player ) )
+		ECAM_MoveCursor( player, -1 )
+}
+
+void function MaintOnDown( entity player )
+{
+	if ( MaintIsOpen( player ) )
+		ECAM_MoveCursor( player, 1 )
+}
+
+// D: executable row -> run it; folder / alert title -> toggle fold
+void function MaintOnConfirm( entity player )
+{
+	if ( !MaintIsOpen( player ) )
+		return
+	int cursor = ECAM_GetCursor( player )
+	if ( cursor == 0 )
+		return
+
+	if ( TkFws_HasAction( player, cursor ) )
+		MaintExecute( player, file.states[ player ], TkFws_ActionRepair( player, cursor ), TkFws_ActionPart( player, cursor ) )
+	else if ( ECAM_HasChildren( player, cursor ) )
+		ECAM_Collapse( player, cursor, !ECAM_IsCollapsed( player, cursor ) )
+}
+
+// A: fold the node under the cursor, or go up and fold its parent
+void function MaintOnFold( entity player )
+{
+	if ( !MaintIsOpen( player ) )
+		return
+	int cursor = ECAM_GetCursor( player )
+	if ( cursor == 0 )
+		return
+
+	if ( ECAM_HasChildren( player, cursor ) && !ECAM_IsCollapsed( player, cursor ) )
+	{
+		ECAM_Collapse( player, cursor, true )
+		return
+	}
+	int parentId = ECAM_GetParent( player, cursor )
+	if ( parentId != 0 )
+		ECAM_Collapse( player, parentId, true )	// ECAM moves the cursor up to the parent
+}
+
+void function MaintOnAttack( entity player )
+{
+	if ( !( player in file.states ) )
+		return
+	MaintState state = file.states[ player ]
+	if ( state.busyRepair == -1 )
+		return
+
+	player.Signal( "TkMaintAbort" )
+	MaintSetMsg( state, "已中止 ABORTED" )
+}
+
+// ---- procedures ----
+
+void function MaintExecute( entity player, MaintState state, int repair, int partId )
+{
+	if ( state.busyRepair != -1 )
+	{
+		MaintSetMsg( state, "维修进行中 BUSY" )
+		return
+	}
+	if ( TK_GetLifeId( player ) != state.lifeId )
+		return
+
+	int check = TK_CheckRepair( player, repair, partId )
+	if ( check != eTkRepairCheck.OK )
+	{
+		MaintSetMsg( state, MaintCheckText( check ) )
+		return
+	}
+
+	thread MaintRunRepair( player, state, repair, partId )
+}
+
+void function MaintRunRepair( entity player, MaintState state, int repair, int partId )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "TkLifeEnd" )
+	player.EndSignal( "TkMaintAbort" )
+	player.EndSignal( "TkMaintStop" )
+
+	int lifeId = state.lifeId
+	bool reset = repair == eTkRepair.SYS_RESET
+	state.busyRepair = repair
+	state.busyPart = partId
+	state.busyStart = Time()
+	state.busyEnd = Time() + MaintRepairTime( repair )
+	if ( reset )
+		TK_SetRebooting( player, true )
+
+	OnThreadEnd(
+		function() : ( player, state, lifeId, reset )
+		{
+			state.busyRepair = -1
+			state.busyPart = -1
+			if ( reset && IsValid( player ) && TK_GetLifeId( player ) == lifeId )
+				TK_SetRebooting( player, false )
+		}
+	)
+
+	LOGGER_Log( player, "[MAINT] 开始 " + MaintRepairName( repair ) + MaintTargetText( repair, partId ) )
+
+	float startHit = TK_GetLastHitTime( player )
+	while ( Time() < state.busyEnd )
+	{
+		WaitFrame()
+		// hands-on repairs are interrupted by hull hits; SYS RESET is not
+		if ( !reset && TK_GetLastHitTime( player ) > startHit )
+		{
+			MaintSetMsg( state, "受到攻击 已中断 INTERRUPTED" )
+			LOGGER_Log( player, "[MAINT] 维修中断 INTERRUPTED", eLogLevel.WARN )
+			return
+		}
+	}
+
+	if ( TK_PerformRepair( player, repair, partId ) )
+	{
+		MaintSetMsg( state, "完成 DONE" )
+		LOGGER_Log( player, "[MAINT] 完成 " + MaintRepairName( repair ) + MaintTargetText( repair, partId ) )
+	}
+	else
+	{
+		MaintSetMsg( state, "状态已变化 未执行" )
+	}
+}
+
+float function MaintRepairTime( int repair )
+{
+	switch ( repair )
+	{
+		case eTkRepair.SYS_RESET:
+			return MAINT_TIME_RESET
+		case eTkRepair.MAINT_KIT:
+			return MAINT_TIME_KIT
+		case eTkRepair.SPARE_PACK:
+			return MAINT_TIME_SPARE
+	}
+	unreachable
+}
+
+string function MaintRepairName( int repair )
+{
+	switch ( repair )
+	{
+		case eTkRepair.SYS_RESET:
+			return "主系统重启 SYS RESET"
+		case eTkRepair.MAINT_KIT:
+			return "维护包 MAINT KIT"
+		case eTkRepair.SPARE_PACK:
+			return "备件包 SPARE PACK"
+	}
+	unreachable
+}
+
+string function MaintRepairShort( int repair )
+{
+	switch ( repair )
+	{
+		case eTkRepair.SYS_RESET:
+			return "重启"
+		case eTkRepair.MAINT_KIT:
+			return "维护包"
+		case eTkRepair.SPARE_PACK:
+			return "备件包"
+	}
+	unreachable
+}
+
+string function MaintTargetText( int repair, int partId )
+{
+	if ( repair == eTkRepair.SYS_RESET )
+		return ""
+	return " > " + TkFws_PartLabel( partId )
+}
+
+string function MaintCheckText( int check )
+{
+	switch ( check )
+	{
+		case eTkRepairCheck.NO_KIT:
+			return "库存不足 NO STOCK"
+		case eTkRepairCheck.NOT_NEEDED:
+			return "无需维修 NOT REQUIRED"
+		case eTkRepairCheck.PART_OFFLINE:
+			return "部位离线 需备件包"
+		case eTkRepairCheck.REACTOR_CRITICAL:
+			return "反应堆失控 需备件包"
+	}
+	unreachable
+}
+
+void function MaintSetMsg( MaintState state, string msg )
+{
+	state.msg = msg
+	state.msgEnd = Time() + MAINT_MSG_TIME
+}
+
+// ---- annunciator under the crosshair ----
+
+void function MaintThink( entity player )
+{
+	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "TkMaintStop" )
+
+	while ( true )
+	{
+		WaitFrame()
+
+		MaintState state = file.states[ player ]
+		if ( state.open && ( !IsAlive( player ) || TK_GetLifeId( player ) != state.lifeId ) )
+			MaintClose( player, state )
+
+		string frame = MaintRenderAnnunciator( player, state )
+		if ( frame == state.lastFrame )
+			continue
+		state.lastFrame = frame
+		NSSendTUI( player, state.tuiIndex, frame )
+	}
+}
+
+string function MaintRenderAnnunciator( entity player, MaintState state )
+{
+	array<string> lines = []
+
+	if ( TK_GetLifeId( player ) != 0 )
+	{
+		float left = TK_GetMeltdownLeft( player )
+		if ( left >= 0.0 )
+			lines.append( MaintAnnLine( format( "CORE MELTDOWN 堆芯熔毁 T-%ds", int( ceil( left ) ) ), ANN_SGR_WARN ) )
+	}
+
+	string status = MaintStatusText( state )
+	if ( status != "" )
+		lines.append( MaintAnnLine( status, ANN_SGR_INFO ) )
+
+	string frame = ""
+	for ( int i = 0; i < lines.len(); i++ )
+	{
+		if ( i > 0 )
+			frame += "\n"
+		frame += lines[ i ]
+	}
+	return frame
+}
+
+string function MaintStatusText( MaintState state )
+{
+	if ( state.busyRepair != -1 )
+	{
+		float frac = ( Time() - state.busyStart ) / ( state.busyEnd - state.busyStart )
+		if ( frac < 0.0 )
+			frac = 0.0
+		if ( frac > 1.0 )
+			frac = 1.0
+		int filled = int( frac * MAINT_BAR_CELLS )
+		string label = MaintRepairShort( state.busyRepair )
+		if ( state.busyRepair != eTkRepair.SYS_RESET )
+			label += " " + TkFws_PartLabel( state.busyPart )
+		return label + " [" + TuiText_Repeat( "#", filled ) + TuiText_Repeat( "-", MAINT_BAR_CELLS - filled ) + "] " + format( "%d%%", int( frac * 100.0 ) )
+	}
+	if ( Time() < state.msgEnd )
+		return state.msg
+	return ""
+}
+
+// centered, background only behind the text
+string function MaintAnnLine( string text, string sgr )
+{
+	int width = TuiText_Width( text ) + 2
+	int left = ( ANN_COLS - width ) / 2
+	if ( left < 0 )
+		left = 0
+	return TuiText_Spaces( left ) + sgr + " " + text + " " + ANN_SGR_RESET
+}

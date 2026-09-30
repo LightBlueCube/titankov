@@ -1,0 +1,68 @@
+WeaponData
+{
+	Mods
+	{
+		LongRangeAmmo
+		{
+		}
+		Smart_Core
+		{
+		}
+		CloseRangePowerShot
+		{
+		}
+		pas_CloseRangePowerShot
+		{
+		}
+		fd_closerange_helper
+		{
+		}
+		fd_CloseRangePowerShot
+		{
+		}
+		LongRangePowerShot
+		{
+		}
+		pas_LongRangePowerShot
+		{
+		}
+		fd_longrange_helper
+		{
+		}
+		fd_LongRangePowerShot
+		{
+		}
+		SiegeMode
+		{
+		}
+		pas_legion_weapon
+		{
+		}
+		pas_legion_spinup
+		{
+		}
+		fd_piercing_shots
+		{
+		}
+		fd_gun_shield_redirect
+		{
+		}
+
+		// titankov arm damage: keep below every vanilla mod, the mod index is networked
+		// engine budget: 200 code entries per weapon (each kv = 1, each mod = 2).
+		// vanilla predator uses 191, so each tk mod gets exactly ONE entry (total 200).
+		// do not add entries here; fire_rate stands in for spread/reload on this weapon.
+		tk_arm_fault
+		{
+			"fire_rate"		"*0.9"
+		}
+		tk_arm_1
+		{
+			"fire_rate"		"*0.75"
+		}
+		tk_arm_2
+		{
+			"fire_rate"		"*0.5"
+		}
+	}
+}

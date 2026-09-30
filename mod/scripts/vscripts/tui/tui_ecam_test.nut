@@ -10,6 +10,13 @@ global function TuiEcamTest_Init
 // ecam reopen <id>
 // ecam col <id> [0/1]         (2nd arg = collapse, default 1)
 // ecam del <id>
+// ecam memo <key> <text...>
+// ecam memosev <key> <0-4>
+// ecam memodel <key>
+// ecam log <text...>          (test logger)
+// ecam logdemo                (logger demo)
+// ecam hit <part> <damage>    (sv_cheats, part 0-5 = eTkPart; 0 = real hull hit)
+// ecam fault <part> <fault>   (sv_cheats, part 1-5, fault 0 HYD / 1 ELEC / 2 MECH)
 
 void function TuiEcamTest_Init()
 {
@@ -168,6 +175,111 @@ bool function EcamTest_Command( entity player, array<string> args )
 		return true
 	}
 
+	if ( sub == "memo" )
+	{
+		if ( args.len() < 3 )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		string key = args[ 1 ]
+		string text = EcamTest_JoinArgs( args, 2 )
+		ECAM_SetMemo( player, key, text )
+		Chat_ServerPrivateMessage( player, format( "memo set: %s", key ), false )
+		return true
+	}
+
+	if ( sub == "memosev" )
+	{
+		if ( args.len() < 3 )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		string key = args[ 1 ]
+		int severity = args[ 2 ].tointeger()
+		ECAM_SetMemo( player, key, "", severity )
+		Chat_ServerPrivateMessage( player, format( "memo severity updated: %s", key ), false )
+		return true
+	}
+
+	if ( sub == "memodel" )
+	{
+		if ( args.len() < 2 )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		string key = args[ 1 ]
+		ECAM_ClearMemo( player, key )
+		Chat_ServerPrivateMessage( player, format( "memo cleared: %s", key ), false )
+		return true
+	}
+
+	if ( sub == "log" )
+	{
+		if ( args.len() < 2 )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		string text = EcamTest_JoinArgs( args, 1 )
+		LOGGER_Log( player, text )
+		Chat_ServerPrivateMessage( player, "logged", false )
+		return true
+	}
+
+	if ( sub == "logdemo" )
+	{
+		thread EcamTest_LoggerDemo( player )
+		Chat_ServerPrivateMessage( player, "logger demo started", false )
+		return true
+	}
+
+	// damage model hooks: cheat-gated, anyone could otherwise break their own titan
+	if ( sub == "hit" || sub == "fault" )
+	{
+		if ( !GetConVarBool( "sv_cheats" ) )
+		{
+			Chat_ServerPrivateMessage( player, "requires sv_cheats 1", false )
+			return true
+		}
+		if ( args.len() < 3 || TK_GetLifeId( player ) == 0 )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		int part = args[ 1 ].tointeger()
+		if ( part < 0 || part >= eTkPart.COUNT )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+
+		if ( sub == "hit" )
+		{
+			float damage = args[ 2 ].tofloat()
+			TK_Debug_LoadPart( player, part, damage )
+			Chat_ServerPrivateMessage( player, format( "part %d loaded %.1f", part, damage ), false )
+			return true
+		}
+
+		int fault = args[ 2 ].tointeger()
+		if ( part == eTkPart.REACTOR || fault < eTkFault.HYD || fault > eTkFault.MECH )
+		{
+			EcamTest_Usage( player )
+			return true
+		}
+		TK_Debug_AddFault( player, part, fault )
+		Chat_ServerPrivateMessage( player, format( "part %d fault %d", part, fault ), false )
+		return true
+	}
+
 	EcamTest_Usage( player )
 	return true
 }
@@ -203,7 +315,38 @@ void function EcamTest_Demo( entity player )
 
 	ECAM_Insert( player, 0, "CABIN READY FOR DEPARTURE", eEcamSeverity.INFO )
 
+	ECAM_SetMemo( player, "LEFT_ARM", "LEFT ARM OFFLINE", eEcamSeverity.CAUTION )
+	ECAM_SetMemo( player, "RIGHT_LEG", "RIGHT LEG - HYDRAULIC LEAK", eEcamSeverity.WARNING )
+	ECAM_SetMemo( player, "REPAIR_KIT", "REPAIR KIT: 2", eEcamSeverity.INFO )
+	ECAM_SetMemo( player, "SPARE_PARTS", "SPARE PARTS: 1", eEcamSeverity.INFO )
+	ECAM_SetMemo( player, "REACTOR", "REACTOR TEMP: 85%", eEcamSeverity.OK )
+
 	Chat_ServerPrivateMessage( player, format( "ecam demo: fire=%d nav=%d elec=%d apu=%d cnv=%d", fire, nav, elec, apu, cnv ), false )
+}
+
+void function EcamTest_LoggerDemo( entity player )
+{
+	LOGGER_Log( player, "Titan OS initialized", eLogLevel.INFO )
+	wait 0.2
+	LOGGER_Log( player, "Reactor core online", eLogLevel.INFO )
+	wait 0.2
+	LOGGER_Log( player, "Neural link established", eLogLevel.INFO )
+	wait 0.5
+	LOGGER_Log( player, "IMPACT DETECTED - SECTOR 3", eLogLevel.WARN )
+	wait 0.3
+	LOGGER_Log( player, "Initiating damage assessment...", eLogLevel.INFO )
+	wait 0.5
+	LOGGER_Log( player, "Scanning hydraulic systems", eLogLevel.DEBUG )
+	wait 0.4
+	LOGGER_Log( player, "Pressure drop detected in LEFT ARM", eLogLevel.WARN )
+	wait 0.3
+	LOGGER_Log( player, "Actuator response: DEGRADED", eLogLevel.WARN )
+	wait 0.5
+	LOGGER_Log( player, "WARNING: LEFT ARM COMPROMISED", eLogLevel.ERROR )
+	wait 0.3
+	LOGGER_Log( player, "Updating ECAM checklist...", eLogLevel.INFO )
+	wait 0.2
+	LOGGER_Log( player, "Pilot notification complete", eLogLevel.INFO )
 }
 
 void function EcamTest_Usage( entity player )
@@ -214,6 +357,11 @@ void function EcamTest_Usage( entity player )
 	Chat_ServerPrivateMessage( player, "ecam set <id> <text...> | ecam sev <id> <0-3>", false )
 	Chat_ServerPrivateMessage( player, "ecam done <id> [0/1] | ecam reopen <id>", false )
 	Chat_ServerPrivateMessage( player, "ecam col <id> [0/1] | ecam del <id>", false )
+	Chat_ServerPrivateMessage( player, "ecam memo <key> <text...>", false )
+	Chat_ServerPrivateMessage( player, "ecam memosev <key> <0-4> | ecam memodel <key>", false )
+	Chat_ServerPrivateMessage( player, "ecam log <text...> | ecam logdemo", false )
+	Chat_ServerPrivateMessage( player, "ecam hit <part:0-5> <damage>  (sv_cheats, 0 = hull hit)", false )
+	Chat_ServerPrivateMessage( player, "ecam fault <part:1-5> <0 HYD|1 ELEC|2 MECH>  (sv_cheats)", false )
 }
 
 string function EcamTest_JoinArgs( array<string> args, int start )

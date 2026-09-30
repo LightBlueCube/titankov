@@ -1,0 +1,263 @@
+global function TuiLogger_Init
+
+global function LOGGER_Log
+global function LOGGER_Clear
+global function LOGGER_SetVisible
+
+// Scrolling diagnostic logger TUI
+// usage:
+//   LOGGER_Log( player, "IMPACT DETECTED - SECTOR 3" )
+//   LOGGER_Log( player, "SCANNING LEFT ARM ACTUATORS", LOG_LEVEL_INFO )
+
+global enum eLogLevel
+{
+	DEBUG = 0
+	INFO = 1
+	WARN = 2
+	ERROR = 3
+}
+
+const int LOGGER_COLS = 65
+const int LOGGER_ROWS = 12
+const int LOGGER_FONT_SIZE = 20
+const float LOGGER_POS_X = 0.65
+const float LOGGER_POS_Y = 0.05
+const int LOGGER_PRIORITY = 49
+
+const int LOGGER_MAX_LINES = 100
+
+const string LOGGER_SGR_RESET = "\x1b[0m"
+const string LOGGER_SGR_BG = "\x1b[48:6:0:0:0:180m"
+const string LOGGER_SGR_DEBUG = "\x1b[38;2;150;150;150m"
+const string LOGGER_SGR_INFO = "\x1b[38;2;255;255;255m"
+const string LOGGER_SGR_WARN = "\x1b[38;2;255;200;0m"
+const string LOGGER_SGR_ERROR = "\x1b[38;2;255;85;85m"
+const string LOGGER_SGR_TIMESTAMP = "\x1b[38;2;150;150;150m"
+const string LOGGER_SGR_UNIT = "\x1b[38;2;120;200;120m"
+
+struct LogLine
+{
+	string text = ""
+	int level = eLogLevel.INFO
+	float time = 0.0
+}
+
+struct LoggerPlayerState
+{
+	entity player
+	int tuiIndex = -1
+	array<LogLine> lines = []
+	bool visible = true
+	bool dirty = false
+}
+
+table<string, LoggerPlayerState> loggerPlayerStates = {}
+
+void function TuiLogger_Init()
+{
+	AddCallback_OnClientConnected( LoggerOnClientConnected )
+	AddCallback_OnClientDisconnected( LoggerOnClientDisconnected )
+}
+
+void function LoggerOnClientConnected( entity player )
+{
+	LoggerPlayerState state = { ... }
+	state.player = player
+	state.tuiIndex = NSCreateTUI( player, LOGGER_COLS, LOGGER_ROWS, LOGGER_FONT_SIZE, LOGGER_POS_X, LOGGER_POS_Y, LOGGER_PRIORITY )
+	loggerPlayerStates[ player.GetUID() ] <- state
+
+	thread LoggerThink( player )
+}
+
+void function LoggerOnClientDisconnected( entity player )
+{
+	string uid = player.GetUID()
+	if ( uid in loggerPlayerStates )
+		delete loggerPlayerStates[ uid ]
+}
+
+void function LoggerThink( entity player )
+{
+	player.EndSignal( "OnDestroy" )
+
+	while ( true )
+	{
+		string uid = player.GetUID()
+		if ( uid in loggerPlayerStates )
+		{
+			LoggerPlayerState state = loggerPlayerStates[ uid ]
+			if ( state.dirty )
+			{
+				state.dirty = false
+				if ( state.visible )
+					NSSendTUI( player, state.tuiIndex, LoggerRenderFrame( state ) )
+				else
+					NSSendTUI( player, state.tuiIndex, "" )
+			}
+		}
+		WaitFrame()
+	}
+}
+
+void function LOGGER_Log( entity player, string text, int level = eLogLevel.INFO )
+{
+	if ( level < eLogLevel.DEBUG || level > eLogLevel.ERROR )
+		level = eLogLevel.INFO
+
+	LoggerPlayerState state = LoggerGetState( player )
+
+	LogLine line = { ... }
+	line.text = text
+	line.level = level
+	line.time = Time()
+
+	state.lines.append( line )
+
+	while ( state.lines.len() > LOGGER_MAX_LINES )
+		state.lines.remove( 0 )
+
+	state.dirty = true
+}
+
+void function LOGGER_Clear( entity player )
+{
+	LoggerPlayerState state = LoggerGetState( player )
+	state.lines = []
+	state.dirty = true
+}
+
+void function LOGGER_SetVisible( entity player, bool visible )
+{
+	LoggerPlayerState state = LoggerGetState( player )
+	state.visible = visible
+	state.dirty = true
+}
+
+LoggerPlayerState function LoggerGetState( entity player )
+{
+	string uid = player.GetUID()
+	if ( uid in loggerPlayerStates )
+		return loggerPlayerStates[ uid ]
+
+	unreachable
+}
+
+string function LoggerRenderFrame( LoggerPlayerState state )
+{
+	if ( state.lines.len() == 0 )
+		return ""
+
+	array<string> renderedLines = []
+	foreach ( LogLine line in state.lines )
+	{
+		array<string> wrapped = LoggerWrapLine( line )
+		renderedLines.extend( wrapped )
+	}
+
+	int startIdx = 0
+	if ( renderedLines.len() > LOGGER_ROWS )
+		startIdx = renderedLines.len() - LOGGER_ROWS
+
+	string frame = ""
+	for ( int i = startIdx; i < renderedLines.len(); i++ )
+	{
+		if ( i > startIdx )
+			frame += "\n"
+		frame += renderedLines[ i ]
+	}
+
+	return frame
+}
+
+array<string> function LoggerWrapLine( LogLine line )
+{
+	string timestamp = LoggerFormatTimestamp( line.time )
+	string levelPrefix = LoggerLevelPrefix( line.level )
+	string levelFg = LoggerLevelFg( line.level )
+	string levelPrefixFg = LoggerLevelPrefixFg( line.level )
+
+	int prefixWidth = LoggerCalcPrefixWidth( timestamp, levelPrefix )
+
+	int availWidth = LOGGER_COLS - prefixWidth
+	if ( availWidth < 20 )
+		availWidth = 20
+
+	array<string> textLines = TuiText_Wrap( line.text, availWidth )
+	if ( textLines.len() == 0 )
+		textLines.append( "" )
+
+	array<string> result = []
+	for ( int i = 0; i < textLines.len(); i++ )
+	{
+		string composed = ""
+
+		if ( i == 0 )
+		{
+			composed += LOGGER_SGR_BG + LOGGER_SGR_TIMESTAMP + timestamp + " "
+			composed += LOGGER_SGR_BG + LOGGER_SGR_UNIT + "titan-os"
+			composed += LOGGER_SGR_BG + LOGGER_SGR_INFO + "["
+			composed += LOGGER_SGR_BG + levelPrefixFg + levelPrefix
+			composed += LOGGER_SGR_BG + LOGGER_SGR_INFO + "]: "
+			composed += LOGGER_SGR_BG + levelFg + textLines[ i ]
+		}
+		else
+		{
+			composed += LOGGER_SGR_BG + TuiText_Spaces( prefixWidth )
+			composed += LOGGER_SGR_BG + levelFg + textLines[ i ]
+		}
+
+		composed += LOGGER_SGR_RESET
+		result.append( composed )
+	}
+
+	return result
+}
+
+// must match the first-line prefix composed in LoggerWrapLine
+int function LoggerCalcPrefixWidth( string timestamp, string levelPrefix )
+{
+	return TuiText_Width( timestamp + " titan-os[" + levelPrefix + "]: " )
+}
+
+string function LoggerFormatTimestamp( float time )
+{
+	int totalSeconds = int( time )
+	int hours = ( totalSeconds / 3600 ) % 24
+	int minutes = ( totalSeconds / 60 ) % 60
+	int seconds = totalSeconds % 60
+
+	return format( "%02d:%02d:%02d", hours, minutes, seconds )
+}
+
+string function LoggerLevelPrefix( int level )
+{
+	if ( level == eLogLevel.ERROR )
+		return "ERROR"
+	if ( level == eLogLevel.WARN )
+		return "WARN "
+	if ( level == eLogLevel.DEBUG )
+		return "DEBUG"
+	return "INFO "
+}
+
+string function LoggerLevelFg( int level )
+{
+	if ( level == eLogLevel.ERROR )
+		return LOGGER_SGR_ERROR
+	if ( level == eLogLevel.WARN )
+		return LOGGER_SGR_WARN
+	if ( level == eLogLevel.DEBUG )
+		return LOGGER_SGR_DEBUG
+	return LOGGER_SGR_INFO
+}
+
+string function LoggerLevelPrefixFg( int level )
+{
+	if ( level == eLogLevel.ERROR )
+		return LOGGER_SGR_ERROR
+	if ( level == eLogLevel.WARN )
+		return LOGGER_SGR_WARN
+	if ( level == eLogLevel.DEBUG )
+		return LOGGER_SGR_DEBUG
+	return LOGGER_SGR_INFO
+}

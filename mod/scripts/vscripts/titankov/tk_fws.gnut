@@ -1,0 +1,704 @@
+global function TkFws_Init
+global function TkFws_DataValid
+global function TkFws_PartLabel
+global function TkFws_PartReadout
+global function TkFws_HasAction
+global function TkFws_ActionRepair
+global function TkFws_ActionPart
+
+// Flight warning layer: polls tk_parts truth, confirms conditions over time,
+// then drives ECAM alerts / memos and the maintenance log.
+// A part with a sensor bus fault (ELEC) reads XX and only raises DATA INVALID,
+// so its real damage stays hidden until SYS RESET.
+
+const float FWS_TICK = 0.25
+const float FWS_CONFIRM_WARNING = 0.3
+const float FWS_CONFIRM_CAUTION = 1.0
+const float FWS_IMPACT_LOG_INTERVAL = 1.0
+const float FWS_IMPACT_LOG_MIN_DROP = 0.03
+const float FWS_REACTOR_LOW_FRAC = 0.35
+
+const int FWS_MODE_NORMAL = 0
+const int FWS_MODE_REBOOT = 1
+
+const int FWS_MASK_HYD = 1
+const int FWS_MASK_MECH = 4
+
+struct FwsStep
+{
+	string text = ""
+	string target = ""
+	int severity = 0
+	int repair = -1		// eTkRepair, -1 = not executable
+	int partId = -1
+}
+
+// what an executable ECAM row does, keyed by ECAM node id
+struct FwsAction
+{
+	int repair = -1
+	int partId = -1
+}
+
+struct FwsAlertSpec
+{
+	string key = ""
+	int severity = 0
+	string title = ""
+	array<FwsStep> steps = []
+}
+
+struct FwsShown
+{
+	int id = 0
+	string sig = ""
+	string title = ""
+	array<int> stepIds = []
+}
+
+struct FwsPartSnap
+{
+	bool valid = true
+	bool offline = false
+	int faults = 0
+	float loggedFrac = 1.0
+}
+
+struct FwsState
+{
+	int lifeId = 0
+	int mode = 0
+	table<string, float> pending = {}
+	table<string, FwsShown> shown = {}
+	table<string, string> memos = {}
+	array<FwsPartSnap> snaps = []
+	float lastImpactLog = -99.0
+	float lastEjectFail = -99.0
+	table<int, FwsAction> actions = {}
+	int maintRoot = 0
+	int kitFolder = 0
+	int spareFolder = 0
+	array<int> kitRows = []
+	array<int> spareRows = []
+	table<int, string> maintTexts = {}
+}
+
+struct
+{
+	table<entity, FwsState> states
+} file
+
+void function TkFws_Init()
+{
+	if ( GAMETYPE != TITAN_BRAWL )
+		return
+
+	RegisterSignal( "TkFwsStop" )
+	AddCallback_OnClientConnected( FwsOnClientConnected )
+	AddCallback_OnClientDisconnected( FwsOnClientDisconnected )
+}
+
+void function FwsOnClientConnected( entity player )
+{
+	FwsState state = { ... }
+	file.states[ player ] <- state
+	thread FwsThink( player )
+}
+
+void function FwsOnClientDisconnected( entity player )
+{
+	player.Signal( "TkFwsStop" )
+	if ( player in file.states )
+		delete file.states[ player ]
+}
+
+// life start / end is detected by polling tk_parts, so no callback order dependency
+void function FwsThink( entity player )
+{
+	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "TkFwsStop" )
+
+	while ( true )
+	{
+		wait FWS_TICK
+
+		FwsState state = file.states[ player ]
+		int lifeId = TK_GetLifeId( player )
+		if ( lifeId != state.lifeId )
+		{
+			if ( state.lifeId != 0 )
+				FwsEndLife( player, state )
+			if ( lifeId != 0 )
+				FwsBeginLife( player, state, lifeId )
+		}
+
+		if ( state.lifeId != 0 )
+			FwsUpdate( player, state )
+	}
+}
+
+void function FwsBeginLife( entity player, FwsState state, int lifeId )
+{
+	FwsResetDisplay( player, state )
+	state.lifeId = lifeId
+	state.mode = FWS_MODE_NORMAL
+	state.lastEjectFail = TK_GetLastEjectFail( player )
+	state.snaps = []
+	for ( int i = 0; i < eTkPart.COUNT; i++ )
+	{
+		FwsPartSnap snap = { ... }
+		state.snaps.append( snap )
+	}
+
+	LOGGER_Clear( player )
+	LOGGER_SetVisible( player, true )
+	LOGGER_Log( player, "TITAN OS 启动 BOOT" )
+	LOGGER_Log( player, "[BITE] 自检通过 SELF TEST OK" )
+	LOGGER_Log( player, "[MAINT] 长按 E 进入 ECAM 交互 HOLD E: ECAM MAINT" )
+}
+
+void function FwsEndLife( entity player, FwsState state )
+{
+	FwsResetDisplay( player, state )
+	LOGGER_SetVisible( player, true )
+	LOGGER_Log( player, "[SYS] 链路中断 LINK LOST", eLogLevel.WARN )
+	state.lifeId = 0
+}
+
+void function FwsResetDisplay( entity player, FwsState state )
+{
+	ECAM_Clear( player )
+	state.pending = {}
+	state.shown = {}
+	state.memos = {}
+	state.actions = {}
+	state.maintRoot = 0
+	state.kitFolder = 0
+	state.spareFolder = 0
+	state.kitRows = []
+	state.spareRows = []
+	state.maintTexts = {}
+}
+
+void function FwsUpdate( entity player, FwsState state )
+{
+	// cockpit offline only hides the native HUD; ECAM and the log stay up as the last-resort console
+	int mode = TK_IsRebooting( player ) ? FWS_MODE_REBOOT : FWS_MODE_NORMAL
+
+	if ( mode != state.mode )
+	{
+		FwsResetDisplay( player, state )
+		state.mode = mode
+		if ( mode == FWS_MODE_REBOOT )
+			LOGGER_Log( player, "[SYS] 主系统重启中 SYS RESET IN PROG", eLogLevel.WARN )
+	}
+
+	FwsLog( player, state )
+
+	if ( mode == FWS_MODE_REBOOT )
+	{
+		FwsSetMemo( player, state, "0_RESET", "SYS RESET IN PROG 主系统重启中", eEcamSeverity.CAUTION )
+		return
+	}
+
+	FwsReconcile( player, state, FwsCollectAlerts( player ) )
+	FwsUpdateMemos( player, state )
+	FwsUpdateMaint( player, state )
+}
+
+// alerts must hold for a confirm time before showing; clear immediately when gone
+void function FwsReconcile( entity player, FwsState state, array<FwsAlertSpec> specs )
+{
+	table<string, bool> present = {}
+	foreach ( FwsAlertSpec spec in specs )
+	{
+		present[ spec.key ] <- true
+		string sig = FwsSignature( spec )
+
+		if ( spec.key in state.shown )
+		{
+			if ( state.shown[ spec.key ].sig == sig )
+				continue
+			FwsDeleteShown( player, state, spec.key )
+			FwsRaise( player, state, spec, sig, false )
+			continue
+		}
+
+		if ( !( spec.key in state.pending ) )
+			state.pending[ spec.key ] <- Time()
+
+		float confirm = spec.severity == eEcamSeverity.WARNING ? FWS_CONFIRM_WARNING : FWS_CONFIRM_CAUTION
+		if ( Time() - state.pending[ spec.key ] >= confirm )
+			FwsRaise( player, state, spec, sig, true )
+	}
+
+	array<string> stale = []
+	foreach ( string key, float t in state.pending )
+	{
+		if ( !( key in present ) )
+			stale.append( key )
+	}
+	foreach ( string key in stale )
+		delete state.pending[ key ]
+
+	array<string> cleared = []
+	foreach ( string key, FwsShown shown in state.shown )
+	{
+		if ( !( key in present ) )
+			cleared.append( key )
+	}
+	foreach ( string key in cleared )
+	{
+		LOGGER_Log( player, "[FWS] 已解除 CLR: " + state.shown[ key ].title )
+		FwsDeleteShown( player, state, key )
+	}
+}
+
+void function FwsRaise( entity player, FwsState state, FwsAlertSpec spec, string sig, bool announce )
+{
+	int id = ECAM_Insert( player, 0, spec.title, spec.severity )
+	ECAM_SetSelectable( player, id )	// alert title: foldable in interactive mode
+
+	FwsShown shown = { ... }
+	shown.id = id
+	foreach ( FwsStep step in spec.steps )
+	{
+		int stepId = ECAM_Insert( player, id, step.text, step.severity, step.target )
+		shown.stepIds.append( stepId )
+		if ( step.repair != -1 )
+			FwsAddAction( player, state, stepId, step.repair, step.partId )
+	}
+	shown.sig = sig
+	shown.title = spec.title
+	state.shown[ spec.key ] <- shown
+	if ( spec.key in state.pending )
+		delete state.pending[ spec.key ]
+
+	if ( !announce )
+		return
+	int level = spec.severity == eEcamSeverity.WARNING ? eLogLevel.ERROR : eLogLevel.WARN
+	LOGGER_Log( player, "[FWS] " + spec.title, level )
+}
+
+FwsAlertSpec function FwsSpec( string key, int severity, string title )
+{
+	FwsAlertSpec spec = { ... }
+	spec.key = key
+	spec.severity = severity
+	spec.title = title
+	return spec
+}
+
+void function FwsStepAdd( FwsAlertSpec spec, string text, string target, int severity, int repair = -1, int partId = -1 )
+{
+	FwsStep step = { ... }
+	step.text = text
+	step.target = target
+	step.severity = severity
+	step.repair = repair
+	step.partId = partId
+	spec.steps.append( step )
+}
+
+string function FwsSignature( FwsAlertSpec spec )
+{
+	string sig = string( spec.severity ) + "|" + spec.title
+	foreach ( FwsStep step in spec.steps )
+		sig += "|" + step.text + ">" + step.target + ">" + string( step.severity )
+	return sig
+}
+
+// ---- alert table ----
+
+array<FwsAlertSpec> function FwsCollectAlerts( entity player )
+{
+	array<FwsAlertSpec> specs = []
+
+	if ( TK_IsReactorCritical( player ) )
+	{
+		FwsAlertSpec spec = FwsSpec( "REACTOR_BREACH", eEcamSeverity.WARNING, "REACTOR BREACH 反应堆失控" )
+		if ( TK_GetKitCount( player, eTkRepair.SPARE_PACK ) > 0 )
+			FwsStepAdd( spec, "反应堆 备件包", "使用", eEcamSeverity.ACTION, eTkRepair.SPARE_PACK, eTkPart.REACTOR )
+		else
+			FwsStepAdd( spec, "无备件包 NO SPARE", "", eEcamSeverity.INFO )
+		FwsStepAdd( spec, "弹射 EJECT", "E x3", eEcamSeverity.ACTION )
+		specs.append( spec )
+	}
+	else if ( TK_GetPartFrac( player, eTkPart.REACTOR ) < FWS_REACTOR_LOW_FRAC )
+	{
+		FwsAlertSpec spec = FwsSpec( "REACTOR_LOW", eEcamSeverity.CAUTION, "REACTOR LO 反应堆完整性低" )
+		FwsStepAdd( spec, "反应堆 维护包", "使用", eEcamSeverity.ACTION, eTkRepair.MAINT_KIT, eTkPart.REACTOR )
+		specs.append( spec )
+	}
+
+	for ( int i = eTkPart.COCKPIT; i <= eTkPart.RIGHT_LEG; i++ )
+		FwsCollectPartAlerts( player, i, specs )
+
+	bool legsValid = TkFws_DataValid( player, eTkPart.LEFT_LEG ) && TkFws_DataValid( player, eTkPart.RIGHT_LEG )
+	if ( legsValid && TK_IsPartOffline( player, eTkPart.LEFT_LEG ) && TK_IsPartOffline( player, eTkPart.RIGHT_LEG ) )
+	{
+		FwsAlertSpec spec = FwsSpec( "LEGS_INOP", eEcamSeverity.WARNING, "L+R LEG INOP 双腿失效" )
+		FwsStepAdd( spec, "仅可蹲行 无法冲刺", "", eEcamSeverity.INFO )
+		FwsStepAdd( spec, "移动将损伤驾驶舱", "", eEcamSeverity.INFO )
+		specs.append( spec )
+	}
+
+	return specs
+}
+
+// ELEC fault: part reads XX and raises only DATA INVALID, real damage stays hidden
+void function FwsCollectPartAlerts( entity player, int partId, array<FwsAlertSpec> specs )
+{
+	string code = FwsPartCode( partId )
+	string zh = FwsPartZh( partId )
+
+	if ( !TkFws_DataValid( player, partId ) )
+	{
+		FwsAlertSpec spec = FwsSpec( code + "_DATA", eEcamSeverity.CAUTION, code + " DATA INVALID " + zh + "数据无效" )
+		FwsStepAdd( spec, "主系统重启 SYS RESET", "执行", eEcamSeverity.ACTION, eTkRepair.SYS_RESET, eTkPart.REACTOR )
+		specs.append( spec )
+		return
+	}
+
+	if ( TK_IsPartOffline( player, partId ) )
+	{
+		int severity = partId == eTkPart.COCKPIT ? eEcamSeverity.WARNING : eEcamSeverity.CAUTION
+		FwsAlertSpec spec = FwsSpec( code + "_INOP", severity, code + " INOP " + zh + "离线" )
+		FwsStepAdd( spec, FwsOfflineEffect( partId ), "", eEcamSeverity.INFO )
+		if ( partId == eTkPart.COCKPIT )
+			FwsStepAdd( spec, "HUD OFFLINE 平显已离线", "", eEcamSeverity.INFO )
+		FwsStepAdd( spec, zh + " 备件包", "使用", eEcamSeverity.ACTION, eTkRepair.SPARE_PACK, partId )
+		specs.append( spec )
+		return
+	}
+
+	if ( TK_HasFault( player, partId, eTkFault.MECH ) )
+	{
+		FwsAlertSpec spec = FwsSpec( code + "_JAM", eEcamSeverity.CAUTION, code + " ACTR JAM " + zh + "作动器卡滞" )
+		FwsStepAdd( spec, zh + " 备件包", "使用", eEcamSeverity.ACTION, eTkRepair.SPARE_PACK, partId )
+		specs.append( spec )
+	}
+
+	if ( TK_HasFault( player, partId, eTkFault.HYD ) )
+	{
+		FwsAlertSpec spec = FwsSpec( code + "_HYD", eEcamSeverity.CAUTION, code + " HYD LEAK " + zh + "液压泄漏" )
+		FwsStepAdd( spec, "完整性持续下降", "", eEcamSeverity.INFO )
+		FwsStepAdd( spec, zh + " 维护包", "使用", eEcamSeverity.ACTION, eTkRepair.MAINT_KIT, partId )
+		specs.append( spec )
+	}
+}
+
+string function FwsOfflineEffect( int partId )
+{
+	switch ( partId )
+	{
+		case eTkPart.COCKPIT:
+			return "仅防御技能可用 弹射可能失效"
+		case eTkPart.LEFT_ARM:
+		case eTkPart.RIGHT_ARM:
+			return "近战伤害下降"
+		case eTkPart.LEFT_LEG:
+		case eTkPart.RIGHT_LEG:
+			return "移动速度下降"
+	}
+	unreachable
+}
+
+string function FwsPartCode( int partId )
+{
+	switch ( partId )
+	{
+		case eTkPart.REACTOR:
+			return "REACTOR"
+		case eTkPart.COCKPIT:
+			return "COCKPIT"
+		case eTkPart.LEFT_ARM:
+			return "L ARM"
+		case eTkPart.RIGHT_ARM:
+			return "R ARM"
+		case eTkPart.LEFT_LEG:
+			return "L LEG"
+		case eTkPart.RIGHT_LEG:
+			return "R LEG"
+	}
+	unreachable
+}
+
+string function FwsPartZh( int partId )
+{
+	switch ( partId )
+	{
+		case eTkPart.REACTOR:
+			return "反应堆"
+		case eTkPart.COCKPIT:
+			return "驾驶舱"
+		case eTkPart.LEFT_ARM:
+			return "左臂"
+		case eTkPart.RIGHT_ARM:
+			return "右臂"
+		case eTkPart.LEFT_LEG:
+			return "左腿"
+		case eTkPart.RIGHT_LEG:
+			return "右腿"
+	}
+	unreachable
+}
+
+// ---- readouts (shared with the maintenance panel) ----
+
+bool function TkFws_DataValid( entity player, int partId )
+{
+	if ( partId == eTkPart.REACTOR )
+		return true
+	return !TK_HasFault( player, partId, eTkFault.ELEC )
+}
+
+string function TkFws_PartLabel( int partId )
+{
+	return FwsPartZh( partId ) + " " + FwsPartCode( partId )
+}
+
+string function TkFws_PartReadout( entity player, int partId )
+{
+	if ( !TkFws_DataValid( player, partId ) )
+		return "XX"
+	if ( TK_IsPartOffline( player, partId ) )
+		return partId == eTkPart.REACTOR ? "CRIT" : "OFF"
+
+	string text = format( "%d%%", int( ceil( TK_GetPartFrac( player, partId ) * 100.0 ) ) )
+	if ( partId == eTkPart.REACTOR )
+		return text
+	if ( TK_HasFault( player, partId, eTkFault.MECH ) )
+		return text + " JAM"
+	if ( TK_HasFault( player, partId, eTkFault.HYD ) )
+		return text + " HYD"
+	return text
+}
+
+// ---- memos: status page summary under the checklist ----
+
+void function FwsUpdateMemos( entity player, FwsState state )
+{
+	FwsSetMemo( player, state, "1_SD_A", FwsCell( player, eTkPart.REACTOR ) + "  " + FwsCell( player, eTkPart.COCKPIT ), eEcamSeverity.INFO )
+	FwsSetMemo( player, state, "1_SD_B", FwsCell( player, eTkPart.LEFT_ARM ) + "  " + FwsCell( player, eTkPart.RIGHT_ARM ), eEcamSeverity.INFO )
+	FwsSetMemo( player, state, "1_SD_C", FwsCell( player, eTkPart.LEFT_LEG ) + "  " + FwsCell( player, eTkPart.RIGHT_LEG ), eEcamSeverity.INFO )
+
+	float left = TK_GetMeltdownLeft( player )
+	if ( left >= 0.0 )
+		FwsSetMemo( player, state, "0_MELT", format( "CORE MELTDOWN 堆芯熔毁 T-%ds", int( ceil( left ) ) ), eEcamSeverity.WARNING )
+	else
+		FwsClearMemo( player, state, "0_MELT" )
+}
+
+string function FwsCell( entity player, int partId )
+{
+	string label = TkFws_PartLabel( partId )
+	string readout = TkFws_PartReadout( player, partId )
+	return label + TuiText_Spaces( 15 - TuiText_Width( label ) ) + readout + TuiText_Spaces( 9 - TuiText_Width( readout ) )
+}
+
+// ECAM_SetMemo always marks dirty, so only resend on change
+void function FwsSetMemo( entity player, FwsState state, string key, string text, int severity )
+{
+	string sig = string( severity ) + "|" + text
+	if ( key in state.memos && state.memos[ key ] == sig )
+		return
+	state.memos[ key ] <- sig
+	ECAM_SetMemo( player, key, text, severity )
+}
+
+void function FwsClearMemo( entity player, FwsState state, string key )
+{
+	if ( !( key in state.memos ) )
+		return
+	delete state.memos[ key ]
+	ECAM_ClearMemo( player, key )
+}
+
+// ---- maintenance log: diff sensed state against the last snapshot ----
+
+void function FwsLog( entity player, FwsState state )
+{
+	for ( int i = 0; i < eTkPart.COUNT; i++ )
+		FwsLogPart( player, state, i )
+
+	float ejectFail = TK_GetLastEjectFail( player )
+	if ( ejectFail > state.lastEjectFail )
+	{
+		state.lastEjectFail = ejectFail
+		LOGGER_Log( player, "[EJECT] 弹射座椅故障 SEAT FAIL", eLogLevel.ERROR )
+	}
+}
+
+void function FwsLogPart( entity player, FwsState state, int partId )
+{
+	FwsPartSnap snap = state.snaps[ partId ]
+	string label = TkFws_PartLabel( partId )
+
+	bool valid = TkFws_DataValid( player, partId )
+	if ( valid != snap.valid )
+	{
+		snap.valid = valid
+		if ( !valid )
+		{
+			LOGGER_Log( player, "[BITE] " + label + " 数据丢失 BUS FAULT", eLogLevel.WARN )
+			return
+		}
+		LOGGER_Log( player, "[BITE] " + label + " 数据恢复 " + TkFws_PartReadout( player, partId ) )
+		snap.loggedFrac = TK_GetPartFrac( player, partId )
+	}
+	if ( !valid )
+		return	// sensor dead: nothing trustworthy to log
+
+	bool offline = TK_IsPartOffline( player, partId )
+	if ( offline != snap.offline )
+	{
+		snap.offline = offline
+		if ( offline )
+			LOGGER_Log( player, "[BITE] " + label + ( partId == eTkPart.REACTOR ? " 反应堆失控 BREACH" : " 离线 INOP" ), eLogLevel.ERROR )
+		else
+			LOGGER_Log( player, "[MAINT] " + label + " 恢复在线 ONLINE" )
+	}
+
+	int faults = FwsFaultMask( player, partId )
+	int added = faults & ~snap.faults
+	if ( added & FWS_MASK_HYD )
+		LOGGER_Log( player, "[BITE] " + label + " 液压压力低 HYD PRESS LO", eLogLevel.WARN )
+	if ( added & FWS_MASK_MECH )
+		LOGGER_Log( player, "[BITE] " + label + " 作动器卡滞 ACTR JAM", eLogLevel.WARN )
+	snap.faults = faults
+
+	float frac = TK_GetPartFrac( player, partId )
+	if ( frac > snap.loggedFrac )
+	{
+		snap.loggedFrac = frac	// repairs are logged by the maintenance panel
+		return
+	}
+	if ( offline || snap.loggedFrac - frac < FWS_IMPACT_LOG_MIN_DROP )
+		return
+	if ( Time() - state.lastImpactLog < FWS_IMPACT_LOG_INTERVAL )
+		return
+
+	state.lastImpactLog = Time()
+	snap.loggedFrac = frac
+	int level = frac < 0.5 ? eLogLevel.WARN : eLogLevel.INFO
+	LOGGER_Log( player, "[BITE] " + label + " 结构完整性 " + TkFws_PartReadout( player, partId ), level )
+}
+
+// ELEC is reported through data validity, not here
+int function FwsFaultMask( entity player, int partId )
+{
+	if ( partId == eTkPart.REACTOR )
+		return 0
+
+	int mask = 0
+	if ( TK_HasFault( player, partId, eTkFault.HYD ) )
+		mask = mask | FWS_MASK_HYD
+	if ( TK_HasFault( player, partId, eTkFault.MECH ) )
+		mask = mask | FWS_MASK_MECH
+	return mask
+}
+
+// ---- MAINT folder: persistent, collapsed; SYS RESET + one folder per consumable, one row per part ----
+
+void function FwsBuildMaint( entity player, FwsState state )
+{
+	state.maintRoot = ECAM_Insert( player, 0, "MAINT 维护", eEcamSeverity.INFO )
+	ECAM_SetSelectable( player, state.maintRoot )
+	ECAM_Collapse( player, state.maintRoot )
+
+	int reset = ECAM_Insert( player, state.maintRoot, "主系统重启 SYS RESET", eEcamSeverity.ACTION, "执行" )
+	FwsAddAction( player, state, reset, eTkRepair.SYS_RESET, eTkPart.REACTOR )
+
+	state.kitFolder = FwsBuildMaintFolder( player, state, eTkRepair.MAINT_KIT, state.kitRows )
+	state.spareFolder = FwsBuildMaintFolder( player, state, eTkRepair.SPARE_PACK, state.spareRows )
+}
+
+int function FwsBuildMaintFolder( entity player, FwsState state, int repair, array<int> rows )
+{
+	int folder = ECAM_Insert( player, state.maintRoot, FwsMaintFolderText( player, repair ), eEcamSeverity.INFO )
+	ECAM_SetSelectable( player, folder )
+	ECAM_Collapse( player, folder )
+	for ( int i = 0; i < eTkPart.COUNT; i++ )
+	{
+		int row = ECAM_Insert( player, folder, FwsMaintRowText( player, i ), eEcamSeverity.ACTION, "使用" )
+		FwsAddAction( player, state, row, repair, i )
+		rows.append( row )
+	}
+	return folder
+}
+
+// rows are updated in place so fold state and cursor survive
+void function FwsUpdateMaint( entity player, FwsState state )
+{
+	if ( state.maintRoot == 0 )
+		FwsBuildMaint( player, state )
+
+	FwsMaintSetText( player, state, state.kitFolder, FwsMaintFolderText( player, eTkRepair.MAINT_KIT ) )
+	FwsMaintSetText( player, state, state.spareFolder, FwsMaintFolderText( player, eTkRepair.SPARE_PACK ) )
+	for ( int i = 0; i < eTkPart.COUNT; i++ )
+	{
+		string text = FwsMaintRowText( player, i )
+		FwsMaintSetText( player, state, state.kitRows[ i ], text )
+		FwsMaintSetText( player, state, state.spareRows[ i ], text )
+	}
+}
+
+string function FwsMaintFolderText( entity player, int repair )
+{
+	if ( repair == eTkRepair.MAINT_KIT )
+		return format( "维护包 MAINT KIT x%d", TK_GetKitCount( player, repair ) )
+	return format( "备件包 SPARE PACK x%d", TK_GetKitCount( player, repair ) )
+}
+
+string function FwsMaintRowText( entity player, int partId )
+{
+	string label = TkFws_PartLabel( partId )
+	return label + TuiText_Spaces( 15 - TuiText_Width( label ) ) + TkFws_PartReadout( player, partId )
+}
+
+void function FwsMaintSetText( entity player, FwsState state, int id, string text )
+{
+	if ( ( id in state.maintTexts ) && state.maintTexts[ id ] == text )
+		return
+	state.maintTexts[ id ] <- text
+	ECAM_SetText( player, id, text )
+}
+
+// ---- executable rows ----
+
+void function FwsAddAction( entity player, FwsState state, int id, int repair, int partId )
+{
+	FwsAction action = { ... }
+	action.repair = repair
+	action.partId = partId
+	state.actions[ id ] <- action
+	ECAM_SetSelectable( player, id )
+}
+
+void function FwsDeleteShown( entity player, FwsState state, string key )
+{
+	FwsShown shown = state.shown[ key ]
+	foreach ( int stepId in shown.stepIds )
+	{
+		if ( stepId in state.actions )
+			delete state.actions[ stepId ]
+	}
+	ECAM_Delete( player, shown.id )
+	delete state.shown[ key ]
+}
+
+bool function TkFws_HasAction( entity player, int id )
+{
+	return ( player in file.states ) && ( id in file.states[ player ].actions )
+}
+
+int function TkFws_ActionRepair( entity player, int id )
+{
+	return file.states[ player ].actions[ id ].repair
+}
+
+int function TkFws_ActionPart( entity player, int id )
+{
+	return file.states[ player ].actions[ id ].partId
+}
