@@ -1,0 +1,1061 @@
+global function TkParts_Init
+
+global function TK_GetLifeId
+global function TK_GetPartFrac
+global function TK_IsPartOffline
+global function TK_HasFault
+global function TK_IsReactorCritical
+global function TK_GetMeltdownLeft
+global function TK_IsEjectSeatJammed
+global function TK_GetLastEjectFail
+global function TK_NoteEjectFail
+global function TK_GetKitCount
+global function TK_CheckRepair
+global function TK_PerformRepair
+global function TK_SetMaintLock
+global function TK_SetRebooting
+global function TK_IsRebooting
+global function TK_GetLastHitTime
+global function TK_GetLastAttacker
+global function TK_Debug_LoadPart
+global function TK_Debug_AddFault
+
+// Titan damage model (server truth, no UI here)
+// hit -> shield -> external part (cockpit / arms / legs) -> part of the load leaks into the reactor.
+// Reactor integrity IS native health, so vanilla doom / death / HUD bar keep working:
+// reactor 0 -> vanilla doomed -> meltdown timer -> spare pack repair, eject, or core meltdown.
+
+global enum eTkPart
+{
+	REACTOR = 0
+	COCKPIT = 1
+	LEFT_ARM = 2
+	RIGHT_ARM = 3
+	LEFT_LEG = 4
+	RIGHT_LEG = 5
+	COUNT = 6
+}
+
+global enum eTkFault
+{
+	HYD = 0		// hydraulic leak: integrity drain + handling loss, fixed by maint kit
+	ELEC = 1	// sensor bus fault: data invalid, fixed by SYS RESET
+	MECH = 2	// actuator jam: handling loss, fixed by spare pack
+}
+
+global enum eTkRepair
+{
+	SYS_RESET = 0
+	MAINT_KIT = 1
+	SPARE_PACK = 2
+}
+
+global enum eTkRepairCheck
+{
+	OK = 0
+	NO_KIT = 1
+	NOT_NEEDED = 2
+	PART_OFFLINE = 3
+	REACTOR_CRITICAL = 4
+}
+
+// part budgets are fractions of the chassis' native max health
+const float TK_BUDGET_REACTOR = 0.25
+const float TK_BUDGET_COCKPIT = 0.35
+const float TK_BUDGET_ARM = 0.25
+const float TK_BUDGET_LEG = 0.30
+
+const float TK_REACTOR_SHARE = 0.10			// README: hit on a working part leaks 10% into the reactor
+const float TK_REACTOR_SHARE_EXPOSED = 0.50	// part already offline, armour gone
+const float TK_PEN_MIN_DAMAGE = 600.0		// cockpit hit strong enough to maybe reach the reactor
+const float TK_PEN_FULL_DAMAGE = 2000.0
+const float TK_PEN_CHANCE_MIN = 0.2
+const float TK_PEN_CHANCE_MAX = 0.8
+const float TK_PEN_SHARE = 0.5
+
+const float TK_FAULT_HP_FRAC = 0.5			// limbs below this can pick up faults
+const float TK_FAULT_CHANCE_SCALE = 2.0		// chance = damage / maxHp * scale, capped
+const float TK_FAULT_CHANCE_MAX = 0.35
+const float TK_HYD_DRAIN_FRAC = 0.015		// per second
+const float TK_DRAG_SPEED = 60.0			// both legs offline, moving faster than this hurts the cockpit
+const float TK_DRAG_DAMAGE_FRAC = 0.02		// cockpit per second
+
+const int TK_BREACH_MARGIN = 250			// README: reactor load while doomed above this = death
+const float TK_MELTDOWN_TIME = 20.0
+const float TK_MELTDOWN_CHARGE_LEAD = 2.0
+const float TK_EJECT_JAM_CHANCE = 0.5
+const float TK_KIT_HEAL_FRAC = 0.4
+const float TK_SPARE_HP_FRAC = 0.5
+const float TK_REACTOR_RESTART_FRAC = 0.3
+const int TK_START_MAINT_KITS = 2
+const int TK_START_SPARE_PACKS = 1
+const float TK_THINK_INTERVAL = 0.1
+const float TK_FLICKER_COOLDOWN = 0.4
+
+struct TkPart
+{
+	float hp = 0.0
+	float maxHp = 0.0
+	bool offline = false
+	bool hyd = false
+	bool elec = false
+	bool mech = false
+}
+
+struct TkState
+{
+	int lifeId = 0
+	entity soul
+	array<TkPart> parts = []
+	int maintKits = 0
+	int sparePacks = 0
+	bool ejectJammed = false
+	float meltdownEnd = -1.0
+	bool maintLock = false
+	bool rebooting = false
+	float lastHitTime = -99.0
+	float lastFlicker = -99.0
+	bool dirty = true
+	int moveSlowHandle = -1
+	float moveSlowSev = 0.0
+	int turnSlowHandle = -1
+	float turnSlowSev = 0.0
+	bool crouchForced = false
+	bool dashLocked = false
+	bool hudHidden = false
+	bool offhandsLocked = false
+	float savedDodge = 100.0
+	string armMod = ""
+}
+
+struct
+{
+	table<entity, TkState> states
+	table<entity, entity> lastAttacker
+	table<entity, float> lastEjectFail
+	int lifeCounter = 0
+} file
+
+void function TkParts_Init()
+{
+	if ( GAMETYPE != TITAN_BRAWL )
+		return
+
+	RegisterSignal( "TkLifeEnd" )
+	RegisterSignal( "TkReactorRestored" )
+
+	AddCallback_OnPilotBecomesTitan( TkOnPilotBecomesTitan )
+	AddCallback_OnTitanBecomesPilot( TkOnTitanBecomesPilot )
+	AddCallback_OnTitanDoomed( TkOnTitanDoomed )
+	AddCallback_OnPlayerKilled( TkOnPlayerKilled )
+	AddCallback_OnClientDisconnected( TkOnClientDisconnected )
+	AddDamageFinalCallback( "player", TkOnPlayerDamageFinal )
+}
+
+// ---- life cycle ----
+
+void function TkOnPilotBecomesTitan( entity player, entity npcTitan )
+{
+	player.Signal( "TkLifeEnd" )
+
+	float budget = float( player.GetMaxHealth() )
+
+	TkState state = { ... }
+	file.lifeCounter++
+	state.lifeId = file.lifeCounter
+	state.soul = player.GetTitanSoul()
+	state.maintKits = TK_START_MAINT_KITS
+	state.sparePacks = TK_START_SPARE_PACKS
+	for ( int i = 0; i < eTkPart.COUNT; i++ )
+	{
+		TkPart part = { ... }
+		part.maxHp = budget * TkPartBudget( i )
+		part.hp = part.maxHp
+		state.parts.append( part )
+	}
+
+	file.states[ player ] <- state
+	file.lastAttacker[ player ] <- null
+
+	int reactorMax = int( state.parts[ eTkPart.REACTOR ].maxHp )
+	player.SetMaxHealth( reactorMax )
+	player.SetHealth( reactorMax )
+
+	thread TkLifeThink( player, state.lifeId )
+}
+
+void function TkOnTitanBecomesPilot( entity player, entity npcTitan )
+{
+	player.Signal( "TkLifeEnd" )
+}
+
+void function TkOnPlayerKilled( entity victim, entity attacker, var damageInfo )
+{
+	victim.Signal( "TkLifeEnd" )
+}
+
+void function TkOnClientDisconnected( entity player )
+{
+	player.Signal( "TkLifeEnd" )
+	if ( player in file.lastAttacker )
+		delete file.lastAttacker[ player ]
+	if ( player in file.lastEjectFail )
+		delete file.lastEjectFail[ player ]
+}
+
+void function TkLifeThink( entity player, int lifeId )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "TkLifeEnd" )
+
+	OnThreadEnd(
+		function() : ( player, lifeId )
+		{
+			TkEndLife( player, lifeId )
+		}
+	)
+
+	while ( true )
+	{
+		wait TK_THINK_INTERVAL
+		TkThink( player, file.states[ player ] )
+	}
+}
+
+void function TkEndLife( entity player, int lifeId )
+{
+	if ( !( player in file.states ) )
+		return
+	TkState state = file.states[ player ]
+	if ( state.lifeId != lifeId )
+		return	// a newer life already replaced this one
+
+	if ( IsValid( state.soul ) )
+	{
+		if ( state.moveSlowHandle != -1 )
+			StatusEffect_Stop( state.soul, state.moveSlowHandle )
+		if ( state.turnSlowHandle != -1 )
+			StatusEffect_Stop( state.soul, state.turnSlowHandle )
+	}
+
+	if ( IsValid( player ) )
+	{
+		if ( state.crouchForced )
+			player.UnforceCrouch()
+		if ( state.hudHidden )
+			RemoveCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
+		if ( state.maintLock )
+			DeployAndEnableWeapons( player )	// balances the holster from TK_SetMaintLock
+		if ( state.offhandsLocked )
+			TkSetOffhandsAllowed( player, true )
+	}
+
+	delete file.states[ player ]
+}
+
+void function TkThink( entity player, TkState state )
+{
+	if ( state.dashLocked )
+		player.Server_SetDodgePower( 0.0 )
+
+	for ( int i = eTkPart.LEFT_ARM; i <= eTkPart.RIGHT_LEG; i++ )
+	{
+		TkPart part = state.parts[ i ]
+		if ( part.hyd && !part.offline )
+			TkWearPart( state, i, part.maxHp * TK_HYD_DRAIN_FRAC * TK_THINK_INTERVAL )
+	}
+
+	if ( TkBothLegsOffline( state ) && Length2D( player.GetVelocity() ) > TK_DRAG_SPEED )
+	{
+		TkPart cockpit = state.parts[ eTkPart.COCKPIT ]
+		TkWearPart( state, eTkPart.COCKPIT, cockpit.maxHp * TK_DRAG_DAMAGE_FRAC * TK_THINK_INTERVAL )
+	}
+
+	if ( state.dirty )
+		TkApplyEffects( player, state )
+}
+
+// ---- part damage ----
+
+// passive wear (hydraulic leak, leg drag): no reactor leak, no fault roll
+void function TkWearPart( TkState state, int partId, float damage )
+{
+	TkPart part = state.parts[ partId ]
+	if ( part.offline )
+		return
+
+	part.hp -= damage
+	if ( part.hp <= 0.0 )
+		TkSetPartOffline( state, partId )
+}
+
+void function TkSetPartOffline( TkState state, int partId )
+{
+	TkPart part = state.parts[ partId ]
+	part.hp = 0.0
+	part.offline = true
+	part.hyd = false	// nothing left to leak
+	state.dirty = true
+
+	if ( partId == eTkPart.COCKPIT && RandomFloat( 1.0 ) < TK_EJECT_JAM_CHANCE )
+		state.ejectJammed = true
+}
+
+// combat hit on one external part, returns the load that reaches the reactor
+float function TkLoadPart( TkState state, int partId, float damage )
+{
+	TkPart part = state.parts[ partId ]
+	if ( part.offline )
+		return damage * TK_REACTOR_SHARE_EXPOSED
+
+	bool weakened = part.hp < part.maxHp * TK_FAULT_HP_FRAC
+	float absorbed = damage < part.hp ? damage : part.hp
+	part.hp -= absorbed
+	float leak = absorbed * TK_REACTOR_SHARE + ( damage - absorbed ) * TK_REACTOR_SHARE_EXPOSED
+
+	if ( part.hp <= 0.0 )
+		TkSetPartOffline( state, partId )
+	else if ( weakened && partId != eTkPart.COCKPIT )
+		TkRollFault( state, partId, damage )
+
+	return leak
+}
+
+void function TkRollFault( TkState state, int partId, float damage )
+{
+	TkPart part = state.parts[ partId ]
+	float chance = damage / part.maxHp * TK_FAULT_CHANCE_SCALE
+	if ( chance > TK_FAULT_CHANCE_MAX )
+		chance = TK_FAULT_CHANCE_MAX
+	if ( RandomFloat( 1.0 ) >= chance )
+		return
+
+	array<int> candidates = []
+	if ( !part.hyd )
+		candidates.append( eTkFault.HYD )
+	if ( !part.elec )
+		candidates.append( eTkFault.ELEC )
+	if ( !part.mech )
+		candidates.append( eTkFault.MECH )
+	if ( candidates.len() == 0 )
+		return
+
+	TkSetFault( part, candidates[ RandomInt( candidates.len() ) ], true )
+	state.dirty = true
+}
+
+void function TkSetFault( TkPart part, int fault, bool value )
+{
+	switch ( fault )
+	{
+		case eTkFault.HYD:
+			part.hyd = value
+			return
+		case eTkFault.ELEC:
+			part.elec = value
+			return
+		case eTkFault.MECH:
+			part.mech = value
+			return
+	}
+	unreachable
+}
+
+bool function TkPartHasFault( TkPart part, int fault )
+{
+	switch ( fault )
+	{
+		case eTkFault.HYD:
+			return part.hyd
+		case eTkFault.ELEC:
+			return part.elec
+		case eTkFault.MECH:
+			return part.mech
+	}
+	unreachable
+}
+
+// ---- damage pipeline ----
+
+// Runs before vanilla shield / killshot handling. Native damage is rewritten to
+// shieldAbsorb + reactorLoad, so vanilla drains the shield and applies only the reactor load.
+void function TkOnPlayerDamageFinal( entity player, var damageInfo )
+{
+	if ( !( player in file.states ) || !player.IsTitan() )
+		return
+	if ( DamageInfo_GetForceKill( damageInfo ) )
+		return
+	int damageType = DamageInfo_GetCustomDamageType( damageInfo )
+	if ( damageType & DF_DOOMED_HEALTH_LOSS )
+		return
+	if ( IsTitanWithinBubbleShield( player ) || TitanHasBubbleShieldWeapon( player ) )
+		return
+
+	TkState state = file.states[ player ]
+	entity attacker = DamageInfo_GetAttacker( damageInfo )
+	TkScaleMelee( attacker, damageInfo, damageType )
+
+	float raw = DamageInfo_GetDamage( damageInfo )
+	float absorb = TkPredictShieldAbsorb( player, damageInfo, raw )
+	float hull = raw - absorb
+	if ( hull <= 0.0 )
+		return
+
+	state.lastHitTime = Time()
+	if ( IsValid( attacker ) && attacker != player )
+		file.lastAttacker[ player ] <- attacker
+
+	float reactorLoad = TkDistributeHit( player, state, damageInfo, hull )
+	state.dirty = true
+	if ( reactorLoad < 1.0 )
+		reactorLoad = 1.0	// keep hit feedback alive for tiny leaks
+	DamageInfo_SetDamage( damageInfo, absorb + reactorLoad )
+}
+
+// README: one arm offline = 50% melee, both = 30%
+void function TkScaleMelee( entity attacker, var damageInfo, int damageType )
+{
+	if ( !( damageType & DF_MELEE ) || !IsValid( attacker ) || !( attacker in file.states ) )
+		return
+
+	TkState attackerState = file.states[ attacker ]
+	int armsOffline = 0
+	if ( attackerState.parts[ eTkPart.LEFT_ARM ].offline )
+		armsOffline++
+	if ( attackerState.parts[ eTkPart.RIGHT_ARM ].offline )
+		armsOffline++
+
+	if ( armsOffline == 1 )
+		DamageInfo_ScaleDamage( damageInfo, 0.5 )
+	else if ( armsOffline == 2 )
+		DamageInfo_ScaleDamage( damageInfo, 0.3 )
+}
+
+// mirrors ShieldModifyDamage closely enough: shield soaks first unless bypassed
+float function TkPredictShieldAbsorb( entity player, var damageInfo, float raw )
+{
+	if ( DamageInfo_GetCustomDamageType( damageInfo ) & DF_BYPASS_SHIELD )
+		return 0.0
+
+	entity soul = player.GetTitanSoul()
+	if ( !IsValid( soul ) )
+		return 0.0
+
+	float shield = float( soul.GetShieldHealth() )
+	return raw < shield ? raw : shield
+}
+
+float function TkDistributeHit( entity player, TkState state, var damageInfo, float hull )
+{
+	if ( TkIsCockpitHit( player, damageInfo ) )
+		return TkLoadCockpit( player, state, hull )
+
+	switch ( DamageInfo_GetHitGroup( damageInfo ) )
+	{
+		case HITGROUP_LEFTARM:
+			return TkLoadPart( state, eTkPart.LEFT_ARM, hull )
+		case HITGROUP_RIGHTARM:
+			return TkLoadPart( state, eTkPart.RIGHT_ARM, hull )
+		case HITGROUP_LEFTLEG:
+			return TkLoadPart( state, eTkPart.LEFT_LEG, hull )
+		case HITGROUP_RIGHTLEG:
+			return TkLoadPart( state, eTkPart.RIGHT_LEG, hull )
+	}
+
+	// torso / splash / melee: the frame spreads the load over every external part
+	int count = eTkPart.RIGHT_LEG - eTkPart.COCKPIT + 1
+	float share = hull / float( count )
+	float leak = 0.0
+	for ( int i = eTkPart.COCKPIT; i <= eTkPart.RIGHT_LEG; i++ )
+		leak += TkLoadPart( state, i, share )
+	return leak
+}
+
+bool function TkIsCockpitHit( entity player, var damageInfo )
+{
+	if ( !CritWeaponInDamageInfo( damageInfo ) )
+		return false
+
+	entity attacker = DamageInfo_GetAttacker( damageInfo )
+	if ( !IsValid( attacker ) )
+		return false
+
+	return IsCriticalHit( attacker, player, DamageInfo_GetHitBox( damageInfo ), DamageInfo_GetDamage( damageInfo ), DamageInfo_GetDamageType( damageInfo ) )
+}
+
+// README: strong enough cockpit hit may reach the reactor directly
+float function TkLoadCockpit( entity player, TkState state, float damage )
+{
+	if ( state.parts[ eTkPart.COCKPIT ].offline )
+		TkFlicker( player, state )
+
+	float leak = TkLoadPart( state, eTkPart.COCKPIT, damage )
+	if ( damage > TK_PEN_MIN_DAMAGE )
+	{
+		float chance = GraphCapped( damage, TK_PEN_MIN_DAMAGE, TK_PEN_FULL_DAMAGE, TK_PEN_CHANCE_MIN, TK_PEN_CHANCE_MAX )
+		if ( RandomFloat( 1.0 ) < chance )
+			leak += damage * TK_PEN_SHARE
+	}
+	return leak
+}
+
+// README: cockpit already offline and hit again -> screen flicker
+void function TkFlicker( entity player, TkState state )
+{
+	if ( Time() - state.lastFlicker < TK_FLICKER_COOLDOWN )
+		return
+	state.lastFlicker = Time()
+	ScreenFade( player, 255, 255, 255, 180, 0.15, 0.05, FFADE_IN | FFADE_PURGE )
+}
+
+// ---- reactor meltdown ----
+
+void function TkOnTitanDoomed( entity victim, var damageInfo )
+{
+	if ( !victim.IsPlayer() || !( victim in file.states ) )
+		return
+
+	TkState state = file.states[ victim ]
+	state.meltdownEnd = Time() + TK_MELTDOWN_TIME
+	state.dirty = true
+	thread TkMeltdownThink( victim, state.lifeId )
+}
+
+void function TkMeltdownThink( entity player, int lifeId )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "TkLifeEnd" )
+	player.EndSignal( "TkReactorRestored" )
+
+	// vanilla DoomedHealthThink sets doomed health after WaitEndFrame; land after it
+	WaitEndFrame()
+	WaitFrame()
+	player.SetMaxHealth( TK_BREACH_MARGIN )
+	player.SetHealth( TK_BREACH_MARGIN )
+
+	float chargeAt = file.states[ player ].meltdownEnd - TK_MELTDOWN_CHARGE_LEAD
+	if ( chargeAt > Time() )
+		wait chargeAt - Time()
+	EmitSoundOnEntity( player, "titan_nuclear_death_charge" )
+	wait TK_MELTDOWN_CHARGE_LEAD
+
+	TkReactorMeltdown( player )
+}
+
+// README: reactor not repaired in time -> nuclear meltdown without eject
+const int TK_NUKE_EXPLOSIONS = 10
+const float TK_NUKE_TIME = 1.0
+const int TK_NUKE_NORMAL_DAMAGE = 75
+const int TK_NUKE_HEAVY_DAMAGE = 2500
+const float TK_NUKE_INNER_RADIUS = 350.0
+const float TK_NUKE_OUTER_RADIUS = 750.0
+
+void function TkReactorMeltdown( entity player )
+{
+	vector origin = player.GetOrigin()
+	entity attacker = TK_GetLastAttacker( player )
+	if ( !IsValid( attacker ) )
+		attacker = svGlobal.worldspawn
+
+	EmitSoundAtPosition( player.GetTeam(), origin, "titan_nuclear_death_explode" )
+	PlayFX( TITAN_NUCLEAR_CORE_FX_3P, origin + Vector( 0, 0, -100 ), Vector( 0, RandomInt( 360 ), 0 ) )
+	thread TkNuclearBlast( player, origin )
+
+	player.Die( attacker, attacker, { scriptType = DF_EXPLOSION, damageType = DMG_REMOVENORAGDOLL, damageSourceId = damagedef_nuclear_core } )
+}
+
+// damage owned by the dead titan so its team is spared, same as a vanilla nuke eject
+void function TkNuclearBlast( entity owner, vector origin )
+{
+	entity inflictor = CreateEntity( "script_ref" )
+	inflictor.SetOrigin( origin )
+	inflictor.kv.spawnflags = SF_INFOTARGET_ALWAYS_TRANSMIT_TO_CLIENT
+	DispatchSpawn( inflictor )
+
+	OnThreadEnd(
+		function() : ( inflictor )
+		{
+			if ( IsValid( inflictor ) )
+				inflictor.Destroy()
+		}
+	)
+
+	float waitPerExplosion = TK_NUKE_TIME / float( TK_NUKE_EXPLOSIONS )
+	for ( int i = 0; i < TK_NUKE_EXPLOSIONS; i++ )
+	{
+		entity explosionOwner = IsValid( owner ) ? owner : svGlobal.worldspawn
+		RadiusDamage_DamageDef( damagedef_nuclear_core, origin, explosionOwner, inflictor,
+			TK_NUKE_NORMAL_DAMAGE, TK_NUKE_HEAVY_DAMAGE, TK_NUKE_INNER_RADIUS, TK_NUKE_OUTER_RADIUS, 0 )
+		wait waitPerExplosion
+	}
+}
+
+// ---- repair API (timing / interruption is owned by the maintenance panel) ----
+
+int function TK_CheckRepair( entity player, int repair, int partId )
+{
+	TkState state = TkGetState( player )
+	TkPart part = state.parts[ partId ]
+	bool reactor = partId == eTkPart.REACTOR
+	bool critical = TK_IsReactorCritical( player )
+	bool spareNeeded = reactor ? critical : ( part.offline || part.mech )
+	bool kitNeeded = reactor ? player.GetHealth() < player.GetMaxHealth() : ( part.hp < part.maxHp || part.hyd )
+
+	switch ( repair )
+	{
+		case eTkRepair.SYS_RESET:
+			return TkAnyFault( state, eTkFault.ELEC ) ? eTkRepairCheck.OK : eTkRepairCheck.NOT_NEEDED
+
+		case eTkRepair.MAINT_KIT:
+			if ( reactor && critical )
+				return eTkRepairCheck.REACTOR_CRITICAL
+			if ( !reactor && part.offline )
+				return eTkRepairCheck.PART_OFFLINE
+			if ( !kitNeeded )
+				return eTkRepairCheck.NOT_NEEDED
+			return state.maintKits > 0 ? eTkRepairCheck.OK : eTkRepairCheck.NO_KIT
+
+		case eTkRepair.SPARE_PACK:
+			if ( !spareNeeded )
+				return eTkRepairCheck.NOT_NEEDED
+			return state.sparePacks > 0 ? eTkRepairCheck.OK : eTkRepairCheck.NO_KIT
+	}
+	unreachable
+}
+
+// caller re-checks right before applying; state can change during the procedure
+bool function TK_PerformRepair( entity player, int repair, int partId )
+{
+	if ( TK_CheckRepair( player, repair, partId ) != eTkRepairCheck.OK )
+		return false
+
+	TkState state = TkGetState( player )
+	TkPart part = state.parts[ partId ]
+
+	switch ( repair )
+	{
+		case eTkRepair.SYS_RESET:
+			foreach ( TkPart p in state.parts )
+				p.elec = false
+			break
+
+		case eTkRepair.MAINT_KIT:
+			state.maintKits--
+			if ( partId == eTkPart.REACTOR )
+			{
+				TkHealReactor( player, TK_KIT_HEAL_FRAC )
+			}
+			else
+			{
+				part.hp = TkMinF( part.maxHp, part.hp + part.maxHp * TK_KIT_HEAL_FRAC )
+				part.hyd = false
+			}
+			break
+
+		case eTkRepair.SPARE_PACK:
+			state.sparePacks--
+			if ( partId == eTkPart.REACTOR )
+				TkRestartReactor( player, state )
+			else
+				TkReplacePart( state, partId )
+			break
+
+		default:
+			unreachable
+	}
+
+	state.dirty = true
+	return true
+}
+
+void function TkReplacePart( TkState state, int partId )
+{
+	TkPart part = state.parts[ partId ]
+	part.offline = false
+	part.hp = TkMinF( part.maxHp, part.hp > part.maxHp * TK_SPARE_HP_FRAC ? part.hp : part.maxHp * TK_SPARE_HP_FRAC )
+	part.hyd = false
+	part.elec = false
+	part.mech = false
+	if ( partId == eTkPart.COCKPIT )
+		state.ejectJammed = false
+}
+
+void function TkHealReactor( entity player, float frac )
+{
+	int maxHealth = player.GetMaxHealth()
+	int health = player.GetHealth() + int( maxHealth * frac )
+	player.SetHealth( health > maxHealth ? maxHealth : health )
+}
+
+// spare pack on a doomed reactor: undoom, stop the meltdown timer, restart at partial output
+void function TkRestartReactor( entity player, TkState state )
+{
+	UndoomTitan( player, 1 )
+	state.meltdownEnd = -1.0
+	player.Signal( "TkReactorRestored" )
+	StopSoundOnEntity( player, "titan_nuclear_death_charge" )
+
+	int reactorMax = int( state.parts[ eTkPart.REACTOR ].maxHp )
+	player.SetMaxHealth( reactorMax )
+	player.SetHealth( int( reactorMax * TK_REACTOR_RESTART_FRAC ) )
+}
+
+// ---- small helpers ----
+
+float function TkMinF( float a, float b )
+{
+	return a < b ? a : b
+}
+
+bool function TkAnyFault( TkState state, int fault )
+{
+	for ( int i = eTkPart.COCKPIT; i <= eTkPart.RIGHT_LEG; i++ )
+	{
+		if ( TkPartHasFault( state.parts[ i ], fault ) )
+			return true
+	}
+	return false
+}
+
+bool function TkBothLegsOffline( TkState state )
+{
+	return state.parts[ eTkPart.LEFT_LEG ].offline && state.parts[ eTkPart.RIGHT_LEG ].offline
+}
+
+// ---- effects: recomputed from part state whenever it changes ----
+
+void function TkApplyEffects( entity player, TkState state )
+{
+	state.dirty = false
+
+	// legs carry the torso twist, so leg faults cost both speed and turn rate
+	float moveSlow = 0.0
+	float turnSlow = 0.0
+	int legsOffline = 0
+	for ( int i = eTkPart.LEFT_LEG; i <= eTkPart.RIGHT_LEG; i++ )
+	{
+		TkPart leg = state.parts[ i ]
+		if ( leg.offline )
+		{
+			legsOffline++
+		}
+		else if ( leg.mech )
+		{
+			moveSlow += 0.2
+			turnSlow += 0.25
+		}
+		if ( leg.hyd )
+		{
+			moveSlow += 0.1
+			turnSlow += 0.15
+		}
+	}
+	if ( legsOffline == 1 )
+		moveSlow += 0.25	// README: one leg offline = 75% speed
+	else if ( legsOffline == 2 )
+		moveSlow += 0.5
+	if ( state.maintLock )
+		moveSlow = 1.0
+	moveSlow = TkMinF( moveSlow, 1.0 )
+
+	turnSlow = TkMinF( turnSlow, 0.8 )
+
+	if ( moveSlow != state.moveSlowSev )
+	{
+		state.moveSlowHandle = TkSwapEffect( state.soul, state.moveSlowHandle, eStatusEffect.move_slow, moveSlow )
+		state.moveSlowSev = moveSlow
+	}
+	if ( turnSlow != state.turnSlowSev )
+	{
+		state.turnSlowHandle = TkSwapEffect( state.soul, state.turnSlowHandle, eStatusEffect.turn_slow, turnSlow )
+		state.turnSlowSev = turnSlow
+	}
+
+	TkApplyToggles( player, state, legsOffline == 2 )
+	TkApplyArmMods( player, state )
+}
+
+int function TkSwapEffect( entity soul, int handle, int effect, float severity )
+{
+	if ( !IsValid( soul ) )
+		return -1
+	if ( handle != -1 )
+		StatusEffect_Stop( soul, handle )
+	if ( severity <= 0.0 )
+		return -1
+	return StatusEffect_AddEndless( soul, effect, severity )
+}
+
+void function TkApplyToggles( entity player, TkState state, bool crawl )
+{
+	// README: both legs offline = crouch only, no dash
+	if ( crawl != state.crouchForced )
+	{
+		if ( crawl )
+			player.ForceCrouch()
+		else
+			player.UnforceCrouch()
+		state.crouchForced = crawl
+	}
+
+	// dodge power is pinned to 0 every think while locked, the saved value comes back on unlock
+	bool dashLock = crawl || state.maintLock
+	if ( dashLock != state.dashLocked )
+	{
+		if ( dashLock )
+		{
+			state.savedDodge = player.GetDodgePower()
+			player.Server_SetDodgePower( 0.0 )
+		}
+		else
+		{
+			player.Server_SetDodgePower( state.savedDodge )
+		}
+		state.dashLocked = dashLock
+	}
+
+	// README: cockpit offline = defensive ability only, HUD offline
+	bool cockpitDown = state.parts[ eTkPart.COCKPIT ].offline
+	if ( cockpitDown != state.offhandsLocked )
+	{
+		TkSetOffhandsAllowed( player, !cockpitDown )
+		state.offhandsLocked = cockpitDown
+	}
+	if ( cockpitDown != state.hudHidden )
+	{
+		if ( cockpitDown )
+			AddCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
+		else
+			RemoveCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
+		state.hudHidden = cockpitDown
+	}
+}
+
+void function TkSetOffhandsAllowed( entity player, bool allowed )
+{
+	foreach ( int slot in [ OFFHAND_ORDNANCE, OFFHAND_TITAN_CENTER, OFFHAND_EQUIPMENT ] )
+	{
+		entity weapon = player.GetOffhandWeapon( slot )
+		if ( IsValid( weapon ) )
+			weapon.AllowUse( allowed )
+	}
+}
+
+// README: one arm offline = 150% spread / 125% reload, both = 300% / 175%; arm HYD / MECH = lighter tk_arm_fault.
+// The mods are defined in keyvalues/ after every vanilla mod, so the networked mod index still matches the client.
+void function TkApplyArmMods( entity player, TkState state )
+{
+	int armsOffline = 0
+	bool armFault = false
+	for ( int i = eTkPart.LEFT_ARM; i <= eTkPart.RIGHT_ARM; i++ )
+	{
+		TkPart arm = state.parts[ i ]
+		if ( arm.offline )
+			armsOffline++
+		else if ( arm.hyd || arm.mech )
+			armFault = true
+	}
+
+	string armMod = ""
+	if ( armsOffline == 2 )
+		armMod = "tk_arm_2"
+	else if ( armsOffline == 1 )
+		armMod = "tk_arm_1"
+	else if ( armFault )
+		armMod = "tk_arm_fault"
+	if ( armMod == state.armMod )
+		return
+	state.armMod = armMod
+
+	foreach ( entity weapon in player.GetMainWeapons() )
+	{
+		if ( !TkWeaponHasArmMods( weapon.GetWeaponClassName() ) )
+			continue
+
+		array<string> mods = []
+		foreach ( string modName in weapon.GetMods() )
+		{
+			if ( modName != "tk_arm_fault" && modName != "tk_arm_1" && modName != "tk_arm_2" )
+				mods.append( modName )
+		}
+		if ( armMod != "" )
+			mods.append( armMod )
+		weapon.SetMods( mods )
+	}
+}
+
+bool function TkWeaponHasArmMods( string className )
+{
+	switch ( className )
+	{
+		case "mp_titanweapon_xo16_vanguard":
+		case "mp_titanweapon_meteor":
+		case "mp_titanweapon_leadwall":
+		case "mp_titanweapon_sniper":
+		case "mp_titanweapon_predator_cannon":
+		case "mp_titanweapon_sticky_40mm":
+		case "mp_titanweapon_particle_accelerator":
+			return true
+	}
+	return false
+}
+
+// ---- getters (callers check TK_GetLifeId() != 0 first) ----
+
+int function TK_GetLifeId( entity player )
+{
+	if ( !( player in file.states ) )
+		return 0
+	return file.states[ player ].lifeId
+}
+
+float function TK_GetPartFrac( entity player, int partId )
+{
+	if ( partId == eTkPart.REACTOR )
+	{
+		if ( TK_IsReactorCritical( player ) )
+			return 0.0
+		return float( player.GetHealth() ) / float( player.GetMaxHealth() )
+	}
+	TkPart part = TkGetState( player ).parts[ partId ]
+	return part.hp / part.maxHp
+}
+
+bool function TK_IsPartOffline( entity player, int partId )
+{
+	if ( partId == eTkPart.REACTOR )
+		return TK_IsReactorCritical( player )
+	return TkGetState( player ).parts[ partId ].offline
+}
+
+bool function TK_HasFault( entity player, int partId, int fault )
+{
+	return TkPartHasFault( TkGetState( player ).parts[ partId ], fault )
+}
+
+bool function TK_IsReactorCritical( entity player )
+{
+	return TkGetState( player ).meltdownEnd > 0.0
+}
+
+float function TK_GetMeltdownLeft( entity player )
+{
+	float end = TkGetState( player ).meltdownEnd
+	if ( end < 0.0 )
+		return -1.0
+	float left = end - Time()
+	return left > 0.0 ? left : 0.0
+}
+
+bool function TK_IsEjectSeatJammed( entity player )
+{
+	return TkGetState( player ).ejectJammed
+}
+
+// survives life end so the eject kill can still credit the attacker
+float function TK_GetLastEjectFail( entity player )
+{
+	return player in file.lastEjectFail ? file.lastEjectFail[ player ] : -99.0
+}
+
+void function TK_NoteEjectFail( entity player )
+{
+	file.lastEjectFail[ player ] <- Time()
+}
+
+int function TK_GetKitCount( entity player, int repair )
+{
+	TkState state = TkGetState( player )
+	if ( repair == eTkRepair.MAINT_KIT )
+		return state.maintKits
+	if ( repair == eTkRepair.SPARE_PACK )
+		return state.sparePacks
+	unreachable
+}
+
+// maintenance panel open: freeze + no dash, applied immediately
+void function TK_SetMaintLock( entity player, bool locked )
+{
+	TkState state = TkGetState( player )
+	if ( state.maintLock == locked )
+		return
+	state.maintLock = locked
+	// weapons stowed while working on the titan
+	if ( locked )
+		HolsterAndDisableWeapons( player )
+	else
+		DeployAndEnableWeapons( player )
+	TkApplyEffects( player, state )
+}
+
+void function TK_SetRebooting( entity player, bool rebooting )
+{
+	TkGetState( player ).rebooting = rebooting
+}
+
+bool function TK_IsRebooting( entity player )
+{
+	return TkGetState( player ).rebooting
+}
+
+float function TK_GetLastHitTime( entity player )
+{
+	return TkGetState( player ).lastHitTime
+}
+
+entity function TK_GetLastAttacker( entity player )
+{
+	return player in file.lastAttacker ? file.lastAttacker[ player ] : null
+}
+
+// ---- debug (test commands) ----
+
+// reactor: real hull hit through the damage pipeline; limbs: direct part load
+void function TK_Debug_LoadPart( entity player, int partId, float damage )
+{
+	if ( partId == eTkPart.REACTOR )
+	{
+		player.TakeDamage( damage, svGlobal.worldspawn, svGlobal.worldspawn, { damageSourceId = damagedef_unknown } )
+		return
+	}
+
+	TkState state = TkGetState( player )
+	float leak = TkLoadPart( state, partId, damage )
+	int health = player.GetHealth() - int( leak )
+	player.SetHealth( health > 1 ? health : 1 )
+	state.dirty = true
+}
+
+void function TK_Debug_AddFault( entity player, int partId, int fault )
+{
+	TkState state = TkGetState( player )
+	TkSetFault( state.parts[ partId ], fault, true )
+	state.dirty = true
+}
+
+TkState function TkGetState( entity player )
+{
+	if ( player in file.states )
+		return file.states[ player ]
+	unreachable
+}
+
+float function TkPartBudget( int partId )
+{
+	switch ( partId )
+	{
+		case eTkPart.REACTOR:
+			return TK_BUDGET_REACTOR
+		case eTkPart.COCKPIT:
+			return TK_BUDGET_COCKPIT
+		case eTkPart.LEFT_ARM:
+		case eTkPart.RIGHT_ARM:
+			return TK_BUDGET_ARM
+		case eTkPart.LEFT_LEG:
+		case eTkPart.RIGHT_LEG:
+			return TK_BUDGET_LEG
+	}
+	unreachable
+}

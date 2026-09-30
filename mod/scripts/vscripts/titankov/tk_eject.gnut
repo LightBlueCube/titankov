@@ -1,0 +1,89 @@
+global function TkEject_Init
+
+// Eject policy for titan brawl (README):
+// - eject only while the reactor is critical (doomed)
+// - cockpit offline may jam the eject seat (rolled once in tk_parts)
+// - no pilot phase: the ejected pilot dies on landing, kill credited to the titan's last attacker
+// Done at runtime instead of overriding class_titan.gnut / sh_titan.gnut.
+
+struct
+{
+	bool functionref( entity, array<string> ) vanillaEject
+} file
+
+void function TkEject_Init()
+{
+	if ( GAMETYPE != TITAN_BRAWL )
+		return
+
+	AddCallback_EntitiesDidLoad( TkEjectOnEntitiesDidLoad )
+	AddCallback_OnPilotBecomesTitan( TkEjectOnPilotBecomesTitan )
+	AddCallback_OnTitanBecomesPilot( TkEjectOnTitanBecomesPilot )
+}
+
+// runs after every script init, so this lands after GamemodeTTDM_Init sets exit to Never
+void function TkEjectOnEntitiesDidLoad()
+{
+	// Never also hides the doomed eject prompt on the client; disembark is blocked per player below
+	Riff_ForceTitanExitEnabled( eTitanExitEnabled.Default )
+
+	if ( !( "TitanEject" in svGlobal.clientCommandCallbacks ) )
+		unreachable
+	file.vanillaEject = svGlobal.clientCommandCallbacks[ "TitanEject" ]
+	svGlobal.clientCommandCallbacks[ "TitanEject" ] = TkEjectCommand
+}
+
+bool function TkEjectCommand( entity player, array<string> args )
+{
+	if ( TK_GetLifeId( player ) == 0 )
+		return file.vanillaEject( player, args )
+
+	if ( !TK_IsReactorCritical( player ) )
+		return true
+
+	if ( TK_IsEjectSeatJammed( player ) )
+	{
+		TK_NoteEjectFail( player )
+		return true
+	}
+
+	return file.vanillaEject( player, args )
+}
+
+void function TkEjectOnPilotBecomesTitan( entity player, entity npcTitan )
+{
+	DisableTitanExit( player )
+}
+
+// disembark is disabled for every player in this mode, so becoming a pilot here always means eject
+void function TkEjectOnTitanBecomesPilot( entity player, entity npcTitan )
+{
+	thread TkKillPilotOnLanding( player )
+}
+
+void function TkKillPilotOnLanding( entity player )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+
+	WaitFrame()	// vanilla restores pilot settings right after the callback
+
+	array<string> mods = player.GetPlayerSettingsMods()
+	if ( !mods.contains( "disable_wallrun" ) )
+		mods.append( "disable_wallrun" )
+	if ( !mods.contains( "disable_doublejump" ) )
+		mods.append( "disable_doublejump" )
+	player.SetPlayerSettingsWithMods( player.GetPlayerSettings(), mods )
+
+	// wait for the eject launch, then for touchdown
+	float leaveDeadline = Time() + 3.0
+	while ( player.IsOnGround() && Time() < leaveDeadline )
+		WaitFrame()
+	while ( !player.IsOnGround() || IsValid( player.GetParent() ) )
+		WaitFrame()
+
+	entity attacker = TK_GetLastAttacker( player )
+	if ( !IsValid( attacker ) )
+		attacker = svGlobal.worldspawn
+	player.Die( attacker, attacker, { damageSourceId = eDamageSourceId.fall } )
+}

@@ -1,0 +1,168 @@
+global function TuiText_Width
+global function TuiText_Wrap
+global function TuiText_SplitChars
+global function TuiText_CharWidth
+global function TuiText_Spaces
+global function TuiText_Repeat
+
+// Terminal cell helpers shared by the TUI panels.
+// Width rules mirror the client renderer (ns_srvsidetui client/tui.cpp WIDE_RANGES):
+// CJK / fullwidth chars take 2 cells, stray UTF-8 continuation bytes 0, everything else 1.
+
+int function TuiText_Width( string s )
+{
+	int width = 0
+	foreach ( string ch in TuiText_SplitChars( s ) )
+		width += TuiText_CharWidth( ch )
+	return width
+}
+
+// Word wrap to `avail` cells. Words wider than a line are broken per char,
+// since CJK text usually has no spaces to break on.
+array<string> function TuiText_Wrap( string text, int avail )
+{
+	array<string> lines = []
+
+	foreach ( string hard in split( text, "\n" ) )
+	{
+		string current = ""
+		int currentWidth = 0
+
+		foreach ( string word in split( hard, " " ) )
+		{
+			if ( word == "" )
+				continue
+
+			int wordWidth = TuiText_Width( word )
+			int joinedWidth = currentWidth == 0 ? wordWidth : currentWidth + 1 + wordWidth
+			if ( joinedWidth <= avail )
+			{
+				current = currentWidth == 0 ? word : current + " " + word
+				currentWidth = joinedWidth
+				continue
+			}
+
+			if ( currentWidth > 0 )
+			{
+				lines.append( current )
+				current = ""
+				currentWidth = 0
+			}
+
+			if ( wordWidth <= avail )
+			{
+				current = word
+				currentWidth = wordWidth
+				continue
+			}
+
+			// word longer than a whole line: hard break per char
+			foreach ( string ch in TuiText_SplitChars( word ) )
+			{
+				int chWidth = TuiText_CharWidth( ch )
+				if ( currentWidth + chWidth > avail )
+				{
+					lines.append( current )
+					current = ""
+					currentWidth = 0
+				}
+				current += ch
+				currentWidth += chWidth
+			}
+		}
+
+		lines.append( current )
+	}
+
+	return lines
+}
+
+// Split a UTF-8 string into chars (one string per code point)
+array<string> function TuiText_SplitChars( string s )
+{
+	array<string> chars = []
+	int i = 0
+	while ( i < s.len() )
+	{
+		int seqLen = TuiTextSeqLen( TuiTextByteAt( s, i ) )
+		int end = i + seqLen
+		if ( end > s.len() )
+			end = s.len()
+
+		chars.append( s.slice( i, end ) )
+		i = end
+	}
+	return chars
+}
+
+int function TuiText_CharWidth( string ch )
+{
+	int lead = TuiTextByteAt( ch, 0 )
+	if ( lead < 0x80 )
+		return 1
+	if ( lead < 0xC0 )
+		return 0
+
+	int seqLen = TuiTextSeqLen( lead )
+	int codepoint = lead & ( 0xFF >> ( seqLen + 1 ) )
+	for ( int k = 1; k < seqLen && k < ch.len(); k++ )
+		codepoint = ( codepoint << 6 ) | ( TuiTextByteAt( ch, k ) & 0x3F )
+
+	return TuiTextIsWide( codepoint ) ? 2 : 1
+}
+
+string function TuiText_Spaces( int count )
+{
+	return TuiText_Repeat( " ", count )
+}
+
+string function TuiText_Repeat( string ch, int count )
+{
+	string s = ""
+	for ( int i = 0; i < count; i++ )
+		s += ch
+	return s
+}
+
+int function TuiTextByteAt( string s, int i )
+{
+	return expect int( s[ i ] ) & 0xFF
+}
+
+int function TuiTextSeqLen( int lead )
+{
+	if ( lead < 0xC0 )
+		return 1
+	if ( lead < 0xE0 )
+		return 2
+	if ( lead < 0xF0 )
+		return 3
+	return 4
+}
+
+bool function TuiTextIsWide( int cp )
+{
+	if ( cp >= 0x1100 && cp <= 0x115F )
+		return true
+	if ( cp >= 0x2E80 && cp <= 0x303E )
+		return true
+	if ( cp >= 0x3041 && cp <= 0x33FF )
+		return true
+	if ( cp >= 0x3400 && cp <= 0x4DBF )
+		return true
+	if ( cp >= 0x4E00 && cp <= 0x9FFF )
+		return true
+	if ( cp >= 0xAC00 && cp <= 0xD7A3 )
+		return true
+	if ( cp >= 0xF900 && cp <= 0xFAFF )
+		return true
+	if ( cp >= 0xFE10 && cp <= 0xFE19 )
+		return true
+	if ( cp >= 0xFE30 && cp <= 0xFE6B )
+		return true
+	if ( cp >= 0xFF01 && cp <= 0xFF60 )
+		return true
+	if ( cp >= 0xFFE0 && cp <= 0xFFE6 )
+		return true
+	return false
+}

@@ -33,10 +33,49 @@
 			}
 		},
 		{
+			"Path": "tui/tui_text.gnut",
+			"RunOn": "SERVER && MP"
+		},
+		{
+			"Path": "tui/tui_logger.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TuiLogger_Init"
+			}
+		},
+		{
 			"Path": "tui/tui_ecam.gnut",
 			"RunOn": "SERVER && MP",
 			"ServerCallback": {
 				"After": "TuiEcam_Init"
+			}
+		},
+		{
+			"Path": "titankov/tk_parts.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TkParts_Init"
+			}
+		},
+		{
+			"Path": "titankov/tk_eject.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TkEject_Init"
+			}
+		},
+		{
+			"Path": "titankov/tk_fws.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TkFws_Init"
+			}
+		},
+		{
+			"Path": "titankov/tk_maint.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TkMaint_Init"
 			}
 		},
 		{

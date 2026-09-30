@@ -8,6 +8,15 @@ global function ECAM_Reopen
 global function ECAM_Collapse
 global function ECAM_Delete
 global function ECAM_Clear
+global function ECAM_SetMemo
+global function ECAM_ClearMemo
+global function ECAM_SetSelectable
+global function ECAM_SetInteractive
+global function ECAM_MoveCursor
+global function ECAM_GetCursor
+global function ECAM_GetParent
+global function ECAM_HasChildren
+global function ECAM_IsCollapsed
 
 // ECAM checklist lib
 // usage:
@@ -34,6 +43,7 @@ const int ECAM_PRIORITY = 50
 
 const int ECAM_INDENT_COLS = 2
 const int ECAM_CONTENT_COLS = 58
+const int ECAM_MEMO_MAX_ROWS = 6
 
 // palette sampled from iniBuilds A350 ECAM textures (Data/Textures/ECAM)
 const string ECAM_SGR_RESET = "\x1b[0m"
@@ -46,6 +56,9 @@ const string ECAM_SGR_INFO = "\x1b[38;2;198;217;219m"
 const string ECAM_SGR_ACTION = "\x1b[38;2;57;189;214m"
 const string ECAM_SGR_OK = "\x1b[38;2;39;216;26m"
 const string ECAM_SGR_DIM = "\x1b[38;2;119;119;119m"
+const string ECAM_SGR_MEMO = "\x1b[38;2;39;216;26m"
+
+const string ECAM_SGR_SEL_BG = "\x1b[48:6:40:90:110:240m"
 
 struct EcamNode
 {
@@ -60,6 +73,7 @@ struct EcamNode
 	int seq = 0
 	int doneSeq = 0
 	array<int> children = []
+	bool selectable = false
 }
 
 struct EcamRowSeg
@@ -74,6 +88,13 @@ struct EcamRow
 	int width = 0
 	bool warn = false
 	bool title = false
+	bool selected = false
+}
+
+struct EcamMemoItem
+{
+	string text = ""
+	int severity = 0
 }
 
 struct EcamPlayerState
@@ -85,7 +106,11 @@ struct EcamPlayerState
 	int doneCounter = 0
 	table<int, EcamNode> nodes = {}
 	array<int> roots = []
+	table<string, EcamMemoItem> memos = {}
 	bool dirty = false
+	bool interactive = false
+	int cursor = 0
+	int cursorRow = -1
 }
 
 table<string, EcamPlayerState> ecamPlayerStates = {}
@@ -285,6 +310,159 @@ void function ECAM_Clear( entity player )
 	EcamClearState( ecamPlayerStates[ uid ] )
 }
 
+// Memos are keyed status lines pinned under the checklist.
+// Empty text keeps the current text, so a caller can change only the severity.
+void function ECAM_SetMemo( entity player, string key, string text, int severity = eEcamSeverity.INFO )
+{
+	if ( severity < eEcamSeverity.INFO || severity > eEcamSeverity.WARNING )
+		unreachable
+
+	EcamPlayerState state = EcamGetState( player )
+
+	if ( key in state.memos )
+	{
+		EcamMemoItem memo = state.memos[ key ]
+		if ( text == "" )
+			text = memo.text
+
+		// callers poll every tick; only resend the frame on real changes
+		if ( memo.text == text && memo.severity == severity )
+			return
+
+		memo.text = text
+		memo.severity = severity
+	}
+	else
+	{
+		EcamMemoItem memo = { ... }
+		memo.text = text
+		memo.severity = severity
+		state.memos[ key ] <- memo
+	}
+
+	state.dirty = true
+}
+
+void function ECAM_ClearMemo( entity player, string key )
+{
+	EcamPlayerState state = EcamGetState( player )
+	if ( !( key in state.memos ) )
+		return
+
+	delete state.memos[ key ]
+	state.dirty = true
+}
+
+// ---- interactive mode: a cursor over selectable nodes; the caller decides what a node does ----
+
+void function ECAM_SetSelectable( entity player, int index, bool selectable = true )
+{
+	EcamPlayerState state = EcamGetState( player )
+	EcamGetNode( state, index ).selectable = selectable
+	state.dirty = true
+}
+
+void function ECAM_SetInteractive( entity player, bool interactive )
+{
+	EcamPlayerState state = EcamGetState( player )
+	if ( state.interactive == interactive )
+		return
+	state.interactive = interactive
+	state.dirty = true
+}
+
+void function ECAM_MoveCursor( entity player, int delta )
+{
+	EcamPlayerState state = EcamGetState( player )
+	EcamFixCursor( state )
+	array<int> visible = EcamVisibleSelectable( state )
+	if ( visible.len() == 0 )
+		return
+
+	int at = 0
+	for ( int i = 0; i < visible.len(); i++ )
+	{
+		if ( visible[ i ] == state.cursor )
+		{
+			at = i
+			break
+		}
+	}
+	at += delta
+	if ( at < 0 )
+		at = 0
+	if ( at >= visible.len() )
+		at = visible.len() - 1
+
+	state.cursor = visible[ at ]
+	state.dirty = true
+}
+
+// 0 when not interactive or nothing is selectable
+int function ECAM_GetCursor( entity player )
+{
+	string uid = player.GetUID()
+	if ( !( uid in ecamPlayerStates ) )
+		return 0
+	EcamPlayerState state = ecamPlayerStates[ uid ]
+	if ( !state.interactive )
+		return 0
+	EcamFixCursor( state )
+	return state.cursor
+}
+
+int function ECAM_GetParent( entity player, int index )
+{
+	return EcamGetNode( EcamGetState( player ), index ).parentId
+}
+
+bool function ECAM_HasChildren( entity player, int index )
+{
+	return EcamGetNode( EcamGetState( player ), index ).children.len() > 0
+}
+
+bool function ECAM_IsCollapsed( entity player, int index )
+{
+	return EcamGetNode( EcamGetState( player ), index ).collapsed
+}
+
+// keep the cursor on a visible selectable node: nearest visible selectable ancestor, else the first one
+void function EcamFixCursor( EcamPlayerState state )
+{
+	array<int> visible = EcamVisibleSelectable( state )
+	int id = state.cursor
+	while ( id != 0 && ( id in state.nodes ) )
+	{
+		if ( visible.contains( id ) )
+		{
+			state.cursor = id
+			return
+		}
+		id = state.nodes[ id ].parentId
+	}
+	state.cursor = visible.len() > 0 ? visible[ 0 ] : 0
+}
+
+// same walk order as EcamLayoutNode
+array<int> function EcamVisibleSelectable( EcamPlayerState state )
+{
+	array<int> out = []
+	foreach ( int id in EcamSortIds( state, state.roots ) )
+		EcamCollectVisible( state, id, out )
+	return out
+}
+
+void function EcamCollectVisible( EcamPlayerState state, int id, array<int> out )
+{
+	EcamNode node = state.nodes[ id ]
+	if ( node.selectable )
+		out.append( id )
+	if ( node.collapsed )
+		return
+	foreach ( int childId in EcamSortIds( state, node.children ) )
+		EcamCollectVisible( state, childId, out )
+}
+
 EcamPlayerState function EcamGetState( entity player )
 {
 	string uid = player.GetUID()
@@ -306,6 +484,7 @@ void function EcamClearState( EcamPlayerState state )
 {
 	state.nodes = {}
 	state.roots = []
+	state.memos = {}
 	state.dirty = true
 }
 
@@ -383,29 +562,58 @@ bool function EcamNodeOrder( EcamPlayerState state, int aId, int bId )
 
 string function EcamRenderFrame( EcamPlayerState state )
 {
-	if ( state.roots.len() == 0 )
+	if ( state.roots.len() == 0 && state.memos.len() == 0 )
 		return ""
+
+	if ( state.interactive )
+		EcamFixCursor( state )
+	state.cursorRow = -1
+
+	// memos are pinned to the bottom, the checklist gets the remaining rows
+	array<EcamRow> memoRows = EcamLayoutMemos( state )
+	int checklistRows = ECAM_ROWS - 1
+	if ( memoRows.len() > 0 )
+		checklistRows -= memoRows.len() + 1
 
 	array<EcamRow> rows = []
 
 	EcamRow titleRow = { ... }
 	titleRow.title = true
+	EcamAppendSeg( titleRow, state.interactive ? "ECAM  交互 W/S移动 D执行 A折叠 长按E退出" : "ECAM", "" )
 	rows.append( titleRow )
 
+	array<EcamRow> nodeRows = []
 	foreach ( int id in EcamSortIds( state, state.roots ) )
-		EcamLayoutNode( state, id, 0, rows )
+		EcamLayoutNode( state, id, 0, nodeRows )
 
-	if ( rows.len() > ECAM_ROWS )
+	if ( nodeRows.len() > checklistRows )
 	{
-		int hiddenCount = rows.len() - ( ECAM_ROWS - 1 )
-		while ( rows.len() > ECAM_ROWS - 1 )
-			rows.pop()
+		int keep = checklistRows - 1
+		int hiddenCount = nodeRows.len() - keep
+		// interactive: scroll so the cursor row stays on screen
+		int start = 0
+		if ( state.cursorRow >= keep )
+			start = state.cursorRow - keep + 1
+		array<EcamRow> window = []
+		for ( int i = start; i < start + keep; i++ )
+			window.append( nodeRows[ i ] )
+		nodeRows = window
 
 		EcamRow moreRow = { ... }
 		string moreText = "... " + format( "+%d MORE", hiddenCount )
 		EcamAppendSeg( moreRow, moreText, ECAM_SGR_CAUTION )
-		moreRow.width = EcamStrWidth( moreText )
-		rows.append( moreRow )
+		moreRow.width = TuiText_Width( moreText )
+		nodeRows.append( moreRow )
+	}
+	rows.extend( nodeRows )
+
+	if ( memoRows.len() > 0 )
+	{
+		EcamRow sepRow = { ... }
+		EcamAppendSeg( sepRow, TuiText_Repeat( "─", ECAM_CONTENT_COLS ), ECAM_SGR_DIM )
+		sepRow.width = ECAM_CONTENT_COLS
+		rows.append( sepRow )
+		rows.extend( memoRows )
 	}
 
 	string frame = ""
@@ -430,9 +638,9 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 	bool hasChildren = node.children.len() > 0
 	bool hasCount = hasChildren && node.collapsed
 	string countText = hasCount ? format( " (%d)", node.children.len() ) : ""
-	int countWidth = hasCount ? EcamStrWidth( countText ) : 0
+	int countWidth = hasCount ? TuiText_Width( countText ) : 0
 
-	array<string> lines = EcamWrapText( node.text, avail )
+	array<string> lines = TuiText_Wrap( node.text, avail )
 	if ( lines.len() == 0 )
 		lines.append( "" )
 
@@ -441,8 +649,8 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 	{
 		if ( lines.len() == 1 )
 		{
-			int used = indent + 2 + EcamStrWidth( lines[ 0 ] ) + countWidth
-			if ( used + 2 + EcamStrWidth( node.target ) <= ECAM_CONTENT_COLS )
+			int used = indent + 2 + TuiText_Width( lines[ 0 ] ) + countWidth
+			if ( used + 2 + TuiText_Width( node.target ) <= ECAM_CONTENT_COLS )
 				alignedTarget = true
 		}
 		if ( !alignedTarget )
@@ -451,7 +659,7 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 			if ( merged != "" )
 				merged += "  "
 			merged += node.target
-			lines = EcamWrapText( merged, avail )
+			lines = TuiText_Wrap( merged, avail )
 			if ( lines.len() == 0 )
 				lines.append( "" )
 		}
@@ -461,16 +669,18 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 	string fg = warn ? "" : EcamNodeFg( node )
 	string targetFg = node.done ? ECAM_SGR_OK : fg
 
+	bool selected = state.interactive && state.cursor == id
 	for ( int i = 0; i < lines.len(); i++ )
 	{
 		EcamRow row = { ... }
 		row.warn = warn
+		row.selected = selected
 		string line = lines[ i ]
-		int width = indent + 2 + EcamStrWidth( line )
+		int width = indent + 2 + TuiText_Width( line )
 
 		if ( i == 0 )
 		{
-			EcamAppendSeg( row, EcamSpaces( indent ), "" )
+			EcamAppendSeg( row, TuiText_Spaces( indent ), "" )
 			string marker = "  "
 			if ( hasChildren )
 				marker = node.collapsed ? "+ " : "- "
@@ -479,7 +689,7 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 		}
 		else
 		{
-			EcamAppendSeg( row, EcamSpaces( indent + 2 ), "" )
+			EcamAppendSeg( row, TuiText_Spaces( indent + 2 ), "" )
 			EcamAppendSeg( row, line, fg )
 		}
 
@@ -492,10 +702,10 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 
 		if ( isLast && alignedTarget )
 		{
-			int targetWidth = EcamStrWidth( node.target )
+			int targetWidth = TuiText_Width( node.target )
 			int dots = ECAM_CONTENT_COLS - width - targetWidth - 2
 			if ( dots > 0 )
-				EcamAppendSeg( row, " " + EcamRepeat( ".", dots ) + " ", warn ? "" : fg )
+				EcamAppendSeg( row, " " + TuiText_Repeat( ".", dots ) + " ", warn ? "" : fg )
 			else
 				EcamAppendSeg( row, "  ", warn ? "" : fg )
 			EcamAppendSeg( row, node.target, warn ? "" : targetFg )
@@ -503,6 +713,8 @@ void function EcamLayoutNode( EcamPlayerState state, int id, int depth, array<Ec
 		}
 
 		row.width = width
+		if ( selected && i == 0 )
+			state.cursorRow = rows.len()
 		rows.append( row )
 	}
 
@@ -528,10 +740,79 @@ string function EcamNodeFg( EcamNode node )
 	return ECAM_SGR_INFO
 }
 
+// severity high to low, then key order, capped at ECAM_MEMO_MAX_ROWS
+array<EcamRow> function EcamLayoutMemos( EcamPlayerState state )
+{
+	array<string> keys = []
+	foreach ( string key, EcamMemoItem memo in state.memos )
+		keys.append( key )
+
+	keys.sort( int function( string a, string b ) : ( state ) {
+		EcamMemoItem memoA = state.memos[ a ]
+		EcamMemoItem memoB = state.memos[ b ]
+		if ( memoA.severity != memoB.severity )
+			return memoB.severity - memoA.severity
+		if ( a < b )
+			return -1
+		if ( a > b )
+			return 1
+		return 0
+	} )
+
+	array<EcamRow> rows = []
+	foreach ( string key in keys )
+	{
+		EcamMemoItem memo = state.memos[ key ]
+		string fg = EcamMemoFg( memo.severity )
+
+		foreach ( string line in TuiText_Wrap( memo.text, ECAM_CONTENT_COLS ) )
+		{
+			if ( rows.len() >= ECAM_MEMO_MAX_ROWS )
+				return rows
+
+			EcamRow row = { ... }
+			EcamAppendSeg( row, line, fg )
+			row.width = TuiText_Width( line )
+			rows.append( row )
+		}
+	}
+	return rows
+}
+
+string function EcamMemoFg( int severity )
+{
+	if ( severity == eEcamSeverity.WARNING )
+		return ECAM_SGR_WARN_FG
+	if ( severity == eEcamSeverity.CAUTION )
+		return ECAM_SGR_CAUTION
+	if ( severity == eEcamSeverity.OK )
+		return ECAM_SGR_OK
+	if ( severity == eEcamSeverity.ACTION )
+		return ECAM_SGR_ACTION
+	return ECAM_SGR_MEMO
+}
+
 string function EcamComposeRow( EcamRow row )
 {
 	if ( row.title )
-		return ECAM_SGR_TITLE + " ECAM" + EcamSpaces( ECAM_CONTENT_COLS - 4 ) + " " + ECAM_SGR_RESET
+	{
+		string title = row.segs.len() > 0 ? row.segs[ 0 ].text : "ECAM"
+		int titlePad = ECAM_CONTENT_COLS - TuiText_Width( title )
+		if ( titlePad < 0 )
+			titlePad = 0
+		return ECAM_SGR_TITLE + " " + title + TuiText_Spaces( titlePad ) + " " + ECAM_SGR_RESET
+	}
+
+	if ( row.selected )
+	{
+		string sel = ECAM_SGR_SEL_BG + " "
+		foreach ( EcamRowSeg seg in row.segs )
+			sel += ( seg.fg == "" ? ECAM_SGR_WARN_FG : seg.fg ) + seg.text
+		int selPad = ECAM_CONTENT_COLS - row.width
+		if ( selPad < 0 )
+			selPad = 0
+		return sel + TuiText_Spaces( selPad ) + " " + ECAM_SGR_RESET
+	}
 
 	if ( row.warn )
 	{
@@ -541,7 +822,7 @@ string function EcamComposeRow( EcamRow row )
 		int pad = ECAM_CONTENT_COLS - row.width
 		if ( pad < 0 )
 			pad = 0
-		return ECAM_SGR_WARN_FG + ECAM_SGR_WARN_BG + " " + text + EcamSpaces( pad ) + " " + ECAM_SGR_RESET
+		return ECAM_SGR_WARN_FG + ECAM_SGR_WARN_BG + " " + text + TuiText_Spaces( pad ) + " " + ECAM_SGR_RESET
 	}
 
 	string out = ECAM_SGR_PANEL_BG + " "
@@ -550,7 +831,7 @@ string function EcamComposeRow( EcamRow row )
 	int pad = ECAM_CONTENT_COLS - row.width
 	if ( pad < 0 )
 		pad = 0
-	out += EcamSpaces( pad ) + " " + ECAM_SGR_RESET
+	out += TuiText_Spaces( pad ) + " " + ECAM_SGR_RESET
 	return out
 }
 
@@ -562,175 +843,3 @@ void function EcamAppendSeg( EcamRow row, string text, string fg )
 	row.segs.append( seg )
 }
 
-array<string> function EcamWrapText( string text, int avail )
-{
-	array<string> lines = []
-
-	foreach ( string hard in split( text, "\n" ) )
-	{
-		string current = ""
-		foreach ( string word in split( hard, " " ) )
-		{
-			if ( word == "" )
-				continue
-
-			int wordWidth = EcamStrWidth( word )
-			if ( wordWidth > avail )
-			{
-				if ( current != "" )
-				{
-					lines.append( current )
-					current = ""
-				}
-
-				if ( EcamIsAscii( word ) )
-				{
-					int pos = 0
-					while ( pos < word.len() )
-					{
-						int rest = word.len() - pos
-						int take = avail < rest ? avail : rest
-						lines.append( word.slice( pos, pos + take ) )
-						pos += take
-					}
-				}
-				else
-				{
-					lines.append( word )
-				}
-				continue
-			}
-
-			if ( current == "" )
-			{
-				current = word
-			}
-			else if ( EcamStrWidth( current ) + 1 + wordWidth <= avail )
-			{
-				current += " " + word
-			}
-			else
-			{
-				lines.append( current )
-				current = word
-			}
-		}
-		lines.append( current )
-	}
-
-	return lines
-}
-
-int function EcamByteAt( string s, int i )
-{
-	return expect int( s[ i ] ) & 0xFF
-}
-
-int function EcamStrWidth( string s )
-{
-	int width = 0
-	int i = 0
-	while ( i < s.len() )
-	{
-		int byte = EcamByteAt( s, i )
-
-		if ( byte < 0x80 )
-		{
-			width += 1
-			i += 1
-			continue
-		}
-
-		if ( byte < 0xC0 )
-		{
-			i += 1
-			continue
-		}
-
-		int seqLen
-		int codepoint
-		if ( byte < 0xE0 )
-		{
-			seqLen = 2
-			codepoint = byte & 0x1F
-		}
-		else if ( byte < 0xF0 )
-		{
-			seqLen = 3
-			codepoint = byte & 0x0F
-		}
-		else
-		{
-			seqLen = 4
-			codepoint = byte & 0x07
-		}
-
-		for ( int k = 1; k < seqLen; k++ )
-		{
-			if ( i + k >= s.len() )
-				break
-			int cont = EcamByteAt( s, i + k )
-			if ( cont < 0x80 || cont >= 0xC0 )
-				break
-			codepoint = ( codepoint << 6 ) | ( cont & 0x3F )
-		}
-
-		width += EcamIsWideChar( codepoint ) ? 2 : 1
-		i += seqLen
-	}
-	return width
-}
-
-// mirrors the wide char ranges of the tui client renderer (ns_srvsidetui client/tui.cpp WIDE_RANGES)
-bool function EcamIsWideChar( int cp )
-{
-	if ( cp >= 0x1100 && cp <= 0x115F )
-		return true
-	if ( cp >= 0x2E80 && cp <= 0x303E )
-		return true
-	if ( cp >= 0x3041 && cp <= 0x33FF )
-		return true
-	if ( cp >= 0x3400 && cp <= 0x4DBF )
-		return true
-	if ( cp >= 0x4E00 && cp <= 0x9FFF )
-		return true
-	if ( cp >= 0xAC00 && cp <= 0xD7A3 )
-		return true
-	if ( cp >= 0xF900 && cp <= 0xFAFF )
-		return true
-	if ( cp >= 0xFE10 && cp <= 0xFE19 )
-		return true
-	if ( cp >= 0xFE30 && cp <= 0xFE6B )
-		return true
-	if ( cp >= 0xFF01 && cp <= 0xFF60 )
-		return true
-	if ( cp >= 0xFFE0 && cp <= 0xFFE6 )
-		return true
-	return false
-}
-
-bool function EcamIsAscii( string s )
-{
-	for ( int i = 0; i < s.len(); i++ )
-	{
-		if ( EcamByteAt( s, i ) >= 0x80 )
-			return false
-	}
-	return true
-}
-
-string function EcamSpaces( int count )
-{
-	return EcamRepeat( " ", count )
-}
-
-string function EcamRepeat( string ch, int count )
-{
-	if ( count <= 0 )
-		return ""
-
-	string s = ""
-	for ( int i = 0; i < count; i++ )
-		s += ch
-	return s
-}

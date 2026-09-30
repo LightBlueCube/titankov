@@ -1,0 +1,98 @@
+WeaponData
+{
+	Mods
+	{
+		proto_particle_accelerator
+		{
+		}
+		proto_particle_accelerator_pas
+		{
+		}
+		sticky_rounds
+		{
+		}
+		burn_mod_titan_particle_accelerator
+		{
+		}
+		pas_ion_weapon_ads
+		{
+		}
+		fd_split_shot_cost
+		{
+		}
+		fd_upgraded_proto_particle_accelerator
+		{
+		}
+		fd_upgraded_proto_particle_accelerator_pas
+		{
+		}
+		fd_balance
+		{
+		}
+
+		// titankov arm damage: keep below every vanilla mod, the mod index is networked
+		tk_arm_fault
+		{
+			"spread_stand_hip"			"*1.2"
+			"spread_stand_hip_run"		"*1.2"
+			"spread_stand_hip_sprint"	"*1.2"
+			"spread_stand_ads"			"*1.2"
+			"spread_crouch_hip"			"*1.2"
+			"spread_crouch_ads"			"*1.2"
+			"spread_air_hip"			"*1.2"
+			"spread_air_ads"			"*1.2"
+			"reload_time"				"*1.1"
+			"reload_time_late1"			"*1.1"
+			"reload_time_late2"			"*1.1"
+			"reload_time_late3"			"*1.1"
+			"reload_time_late4"			"*1.1"
+			"reloadempty_time"			"*1.1"
+			"reloadempty_time_late1"	"*1.1"
+			"reloadempty_time_late2"	"*1.1"
+			"reloadempty_time_late3"	"*1.1"
+			"reloadempty_time_late4"	"*1.1"
+		}
+		tk_arm_1
+		{
+			"spread_stand_hip"			"*1.5"
+			"spread_stand_hip_run"		"*1.5"
+			"spread_stand_hip_sprint"	"*1.5"
+			"spread_stand_ads"			"*1.5"
+			"spread_crouch_hip"			"*1.5"
+			"spread_crouch_ads"			"*1.5"
+			"spread_air_hip"			"*1.5"
+			"spread_air_ads"			"*1.5"
+			"reload_time"				"*1.25"
+			"reload_time_late1"			"*1.25"
+			"reload_time_late2"			"*1.25"
+			"reload_time_late3"			"*1.25"
+			"reload_time_late4"			"*1.25"
+			"reloadempty_time"			"*1.25"
+			"reloadempty_time_late1"	"*1.25"
+			"reloadempty_time_late2"	"*1.25"
+			"reloadempty_time_late3"	"*1.25"
+			"reloadempty_time_late4"	"*1.25"
+		}
+		tk_arm_2
+		{
+			"spread_stand_hip"			"*3.0"
+			"spread_stand_hip_run"		"*3.0"
+			"spread_stand_hip_sprint"	"*3.0"
+			"spread_stand_ads"			"*3.0"
+			"spread_crouch_hip"			"*3.0"
+			"spread_crouch_ads"			"*3.0"
+			"spread_air_hip"			"*3.0"
+			"spread_air_ads"			"*3.0"
+			"reload_time"				"*1.75"
+			"reload_time_late1"			"*1.75"
+			"reload_time_late2"			"*1.75"
+			"reload_time_late3"			"*1.75"
+			"reload_time_late4"			"*1.75"
+			"reloadempty_time"			"*1.75"
+			"reloadempty_time_late1"	"*1.75"
+			"reloadempty_time_late2"	"*1.75"
+			"reloadempty_time_late3"	"*1.75"
+			"reloadempty_time_late4"	"*1.75"
+		}
+	}
+}
