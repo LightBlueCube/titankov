@@ -1,6 +1,43 @@
 {
 	"Name": "titankov",
 	"LoadPriority": 102,
+	"ConVars": [
+		{
+			"Name": "tk_hud_size",
+			"DefaultValue": "9",
+			"HelpString": "泰坦部位状态 HUD（TUI）字号"
+		},
+		{
+			"Name": "tk_hud_x",
+			"DefaultValue": "0.88",
+			"HelpString": "HUD 中心 X（0-1，越大越靠右）"
+		},
+		{
+			"Name": "tk_hud_y",
+			"DefaultValue": "0.77",
+			"HelpString": "HUD 中心 Y（0-1，越大越靠下）"
+		},
+		{
+			"Name": "tk_hud_blink",
+			"DefaultValue": "3",
+			"HelpString": "闪烁/连接动画速度（相位/秒）"
+		},
+		{
+			"Name": "tk_hud_style",
+			"DefaultValue": "1",
+			"HelpString": "样式：0=线条（要求完整框线字体）1=方块（用背景色块，任何字体均为实心）"
+		},
+		{
+			"Name": "tk_hud_lang",
+			"DefaultValue": "0",
+			"HelpString": "状态文字语言：0=英文 1=中文（无信号/连接中）"
+		},
+		{
+			"Name": "tk_hud_hidevanilla",
+			"DefaultValue": "1",
+			"HelpString": "泰坦存活期间隐藏原版主 HUD（0=显示 1=隐藏）"
+		}
+	],
 	"Scripts": [
 
 
@@ -76,6 +113,13 @@
 			"RunOn": "SERVER && MP",
 			"ServerCallback": {
 				"After": "TkMaint_Init"
+			}
+		},
+		{
+			"Path": "tui/tui_titanhud.gnut",
+			"RunOn": "SERVER && MP",
+			"ServerCallback": {
+				"After": "TkHud_Init"
 			}
 		},
 		{

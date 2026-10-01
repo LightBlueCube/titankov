@@ -116,6 +116,7 @@ struct TkState
 	float lastHitTime = -99.0
 	float lastFlicker = -99.0
 	bool dirty = true
+	float doomedDamage = 0.0
 	int moveSlowHandle = -1
 	float moveSlowSev = 0.0
 	int turnSlowHandle = -1
@@ -136,6 +137,10 @@ struct
 	int lifeCounter = 0
 } file
 
+// tk_hud_hidevanilla may be missing if the server was not restarted after mod.json changed,
+// so the cheat command keeps a session value as a fallback.
+bool tkHideVanillaHud = true
+
 void function TkParts_Init()
 {
 	if ( GAMETYPE != TITAN_BRAWL )
@@ -150,6 +155,7 @@ void function TkParts_Init()
 	AddCallback_OnPlayerKilled( TkOnPlayerKilled )
 	AddCallback_OnClientDisconnected( TkOnClientDisconnected )
 	AddDamageFinalCallback( "player", TkOnPlayerDamageFinal )
+	AddClientCommandCallback( "tk_vanillahud", TkCommand_VanillaHud )
 }
 
 // ---- life cycle ----
@@ -180,6 +186,8 @@ void function TkOnPilotBecomesTitan( entity player, entity npcTitan )
 	int reactorMax = int( state.parts[ eTkPart.REACTOR ].maxHp )
 	player.SetMaxHealth( reactorMax )
 	player.SetHealth( reactorMax )
+
+	TkApplyHudFlag( player, state )	// hide the native HUD right at respawn
 
 	thread TkLifeThink( player, state.lifeId )
 }
@@ -244,7 +252,10 @@ void function TkEndLife( entity player, int lifeId )
 		if ( state.crouchForced )
 			player.UnforceCrouch()
 		if ( state.hudHidden )
+		{
 			RemoveCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
+			RemoveCinematicFlag( player, CE_FLAG_TITAN_3P_CAM )	// balances TkApplyHudFlag
+		}
 		if ( state.maintLock )
 			DeployAndEnableWeapons( player )	// balances the holster from TK_SetMaintLock
 		if ( state.offhandsLocked )
@@ -274,6 +285,8 @@ void function TkThink( entity player, TkState state )
 
 	if ( state.dirty )
 		TkApplyEffects( player, state )
+
+	TkApplyHudFlag( player, state )
 }
 
 // ---- part damage ----
@@ -388,9 +401,17 @@ void function TkOnPlayerDamageFinal( entity player, var damageInfo )
 		return
 	int damageType = DamageInfo_GetCustomDamageType( damageInfo )
 	if ( damageType & DF_DOOMED_HEALTH_LOSS )
+	{
+		// 黄血持续掉血也不允许把原生血量打死；死亡一律由本模型决定
+		TkClampLethal( player, damageInfo )
 		return
+	}
 	if ( IsTitanWithinBubbleShield( player ) || TitanHasBubbleShieldWeapon( player ) )
+	{
+		// 泡泡盾路径原本直通原生血量，这里同样只保证不致死
+		TkClampLethal( player, damageInfo )
 		return
+	}
 
 	TkState state = file.states[ player ]
 	entity attacker = DamageInfo_GetAttacker( damageInfo )
@@ -410,6 +431,30 @@ void function TkOnPlayerDamageFinal( entity player, var damageInfo )
 	state.dirty = true
 	if ( reactorLoad < 1.0 )
 		reactorLoad = 1.0	// keep hit feedback alive for tiny leaks
+
+	if ( TK_IsReactorCritical( player ) )
+	{
+		// 黄血：反应堆再承受 TK_BREACH_MARGIN 点后由模型处死
+		state.doomedDamage += reactorLoad
+		if ( state.doomedDamage > float( TK_BREACH_MARGIN ) )
+		{
+			DamageInfo_SetDamage( damageInfo, absorb )
+			thread TkKillFromReactor( player )
+			return
+		}
+		DamageInfo_SetDamage( damageInfo, absorb + TkClampLethalValue( player, reactorLoad ) )
+		return
+	}
+
+	// 非黄血：这一击若会打空反应堆，就把原生血量夹到剩 1 点，再由模型显式进入黄血
+	float room = TkHealthRoom( player )
+	if ( reactorLoad > room )
+	{
+		DamageInfo_SetDamage( damageInfo, absorb + room )
+		thread TkEnterDoom( player )
+		return
+	}
+
 	DamageInfo_SetDamage( damageInfo, absorb + reactorLoad )
 }
 
@@ -509,6 +554,66 @@ void function TkFlicker( entity player, TkState state )
 	ScreenFade( player, 255, 255, 255, 180, 0.15, 0.05, FFADE_IN | FFADE_PURGE )
 }
 
+// ---- lethal clamp: the vanilla health pool must never kill the titan ----
+
+float function TkHealthRoom( entity player )
+{
+	float room = float( player.GetHealth() ) - 1.0
+	return room > 0.0 ? room : 0.0
+}
+
+float function TkClampLethalValue( entity player, float damage )
+{
+	float room = TkHealthRoom( player )
+	return damage > room ? room : damage
+}
+
+void function TkClampLethal( entity player, var damageInfo )
+{
+	DamageInfo_SetDamage( damageInfo, TkClampLethalValue( player, DamageInfo_GetDamage( damageInfo ) ) )
+}
+
+// reactor emptied: the model puts the titan into the doomed state itself.
+// Same trio the vanilla DoomedHealthThink uses, minus its health reset (we clamp instead).
+void function TkEnterDoom( entity player )
+{
+	WaitEndFrame()
+	if ( !IsValid( player ) || TK_GetLifeId( player ) == 0 )
+		return
+	if ( TK_IsReactorCritical( player ) )
+		return
+
+	entity soul = player.GetTitanSoul()
+	if ( !IsValid( soul ) )
+		return
+
+	soul.EnableDoomed()
+	player.SetDoomed()
+	DoomTitan( player )
+	soul.soul.doomedStartTime = Time()
+	soul.doomedTime = Time()
+	player.Signal( "Doomed" )
+	soul.Signal( "Doomed" )
+
+	TkOnTitanDoomed( player, null )
+}
+
+// doomed reactor took more than TK_BREACH_MARGIN: immediate death, no nuke
+void function TkKillFromReactor( entity player )
+{
+	WaitEndFrame()
+	if ( !IsValid( player ) || TK_GetLifeId( player ) == 0 || !IsAlive( player ) )
+		return
+	if ( !TK_IsReactorCritical( player ) )
+		return	// repaired within the frame, let it live
+
+	entity attacker = TK_GetLastAttacker( player )
+	if ( !IsValid( attacker ) )
+		attacker = svGlobal.worldspawn
+
+	player.Die( attacker, attacker, { damageSourceId = damagedef_unknown } )
+}
+
 // ---- reactor meltdown ----
 
 void function TkOnTitanDoomed( entity victim, var damageInfo )
@@ -518,6 +623,7 @@ void function TkOnTitanDoomed( entity victim, var damageInfo )
 
 	TkState state = file.states[ victim ]
 	state.meltdownEnd = Time() + TK_MELTDOWN_TIME
+	state.doomedDamage = 0.0
 	state.dirty = true
 	thread TkMeltdownThink( victim, state.lifeId )
 }
@@ -730,7 +836,7 @@ void function TkApplyEffects( entity player, TkState state )
 {
 	state.dirty = false
 
-	// legs carry the torso twist, so leg faults cost both speed and turn rate
+	// README: leg faults cost speed, arm faults cost turn rate (legs also twist the torso)
 	float moveSlow = 0.0
 	float turnSlow = 0.0
 	int legsOffline = 0
@@ -751,6 +857,17 @@ void function TkApplyEffects( entity player, TkState state )
 			moveSlow += 0.1
 			turnSlow += 0.15
 		}
+	}
+	// README: actuator jam (MECH) / hydraulic leak (HYD) on an arm also slows the torso twist
+	for ( int i = eTkPart.LEFT_ARM; i <= eTkPart.RIGHT_ARM; i++ )
+	{
+		TkPart arm = state.parts[ i ]
+		if ( arm.offline )
+			continue
+		if ( arm.mech )
+			turnSlow += 0.25
+		if ( arm.hyd )
+			turnSlow += 0.15
 	}
 	if ( legsOffline == 1 )
 		moveSlow += 0.25	// README: one leg offline = 75% speed
@@ -816,21 +933,36 @@ void function TkApplyToggles( entity player, TkState state, bool crawl )
 		state.dashLocked = dashLock
 	}
 
-	// README: cockpit offline = defensive ability only, HUD offline
+	// README: cockpit offline = defensive ability only
 	bool cockpitDown = state.parts[ eTkPart.COCKPIT ].offline
 	if ( cockpitDown != state.offhandsLocked )
 	{
 		TkSetOffhandsAllowed( player, !cockpitDown )
 		state.offhandsLocked = cockpitDown
 	}
-	if ( cockpitDown != state.hudHidden )
-	{
-		if ( cockpitDown )
-			AddCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
-		else
-			RemoveCinematicFlag( player, CE_FLAG_HIDE_MAIN_HUD )
-		state.hudHidden = cockpitDown
-	}
+}
+
+// Native main HUD: hidden while the cockpit is offline (README) and, with tk_hud_hidevanilla on,
+// for the whole titan life. Re-asserted every think so gamemode spawn code cannot bring it back.
+// CE_FLAG_TITAN_3P_CAM is what makes the client drop the cockpit RUI (titan health bar) itself
+// (Northstar.Client cl_titan_cockpit.nut UpdateTitanCockpitVisibility).
+void function TkApplyHudFlag( entity player, TkState state )
+{
+	bool wantHidden = state.parts[ eTkPart.COCKPIT ].offline || TkHideVanillaHudOn()
+	state.hudHidden = wantHidden
+	TkSetFlag( player, CE_FLAG_HIDE_MAIN_HUD, wantHidden )
+	TkSetFlag( player, CE_FLAG_TITAN_3P_CAM, wantHidden )
+}
+
+// only writes when the flag really differs (AddCinematicFlag fires CE_FLAGS_CHANGED)
+void function TkSetFlag( entity player, int flag, bool on )
+{
+	if ( on == HasCinematicFlag( player, flag ) )
+		return
+	if ( on )
+		AddCinematicFlag( player, flag )
+	else
+		RemoveCinematicFlag( player, flag )
 }
 
 void function TkSetOffhandsAllowed( entity player, bool allowed )
@@ -1011,6 +1143,63 @@ entity function TK_GetLastAttacker( entity player )
 }
 
 // ---- debug (test commands) ----
+
+bool function TkConVarBool( string name, bool def )
+{
+	bool value = def
+	try
+	{
+		value = GetConVarBool( name )
+	}
+	catch ( e )
+	{
+		return def
+	}
+	return value
+}
+
+// reads the convar when it is registered, otherwise falls back to the command-set session value
+bool function TkHideVanillaHudOn()
+{
+	return TkConVarBool( "tk_hud_hidevanilla", tkHideVanillaHud )
+}
+
+// sv_cheats only: toggle hiding the native main HUD for the whole titan life
+bool function TkCommand_VanillaHud( entity player, array<string> args )
+{
+	if ( !GetConVarBool( "sv_cheats" ) )
+	{
+		Chat_ServerPrivateMessage( player, "requires sv_cheats 1", false )
+		return true
+	}
+
+	int value = TkHideVanillaHudOn() ? 0 : 1
+	if ( args.len() >= 1 )
+		value = args[ 0 ].tointeger() != 0 ? 1 : 0
+	tkHideVanillaHud = value != 0
+
+	bool mirrored = true
+	try
+	{
+		SetConVarInt( "tk_hud_hidevanilla", value )
+	}
+	catch ( e )
+	{
+		mirrored = false
+	}
+
+	foreach ( entity p in GetPlayerArray() )
+	{
+		if ( p in file.states )
+			TkApplyHudFlag( p, file.states[ p ] )
+	}
+
+	string msg = "tk_hud_hidevanilla = " + value
+	if ( !mirrored )
+		msg += " (convar not registered, session value only)"
+	Chat_ServerPrivateMessage( player, msg, false )
+	return true
+}
 
 // reactor: real hull hit through the damage pipeline; limbs: direct part load
 void function TK_Debug_LoadPart( entity player, int partId, float damage )

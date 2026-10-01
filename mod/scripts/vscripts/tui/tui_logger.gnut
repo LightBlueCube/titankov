@@ -3,6 +3,7 @@ global function TuiLogger_Init
 global function LOGGER_Log
 global function LOGGER_Clear
 global function LOGGER_SetVisible
+global function LOGGER_SetBlink
 
 // Scrolling diagnostic logger TUI
 // usage:
@@ -20,11 +21,21 @@ global enum eLogLevel
 const int LOGGER_COLS = 65
 const int LOGGER_ROWS = 12
 const int LOGGER_FONT_SIZE = 20
-const float LOGGER_POS_X = 0.65
+const float LOGGER_POS_X = 0.7
 const float LOGGER_POS_Y = 0.05
 const int LOGGER_PRIORITY = 49
 
 const int LOGGER_MAX_LINES = 100
+
+// random flicker (see LOGGER_SetBlink): short random blackouts mixed with occasional longer dropouts,
+// so it reads as an unstable display instead of a metronome
+const float LOGGER_BLINK_ON_MIN = 0.08
+const float LOGGER_BLINK_ON_MAX = 0.55
+const float LOGGER_BLINK_OFF_MIN = 0.04
+const float LOGGER_BLINK_OFF_MAX = 0.22
+const float LOGGER_BLINK_DROPOUT_CHANCE = 0.2
+const float LOGGER_BLINK_DROPOUT_MIN = 0.30
+const float LOGGER_BLINK_DROPOUT_MAX = 0.90
 
 const string LOGGER_SGR_RESET = "\x1b[0m"
 const string LOGGER_SGR_BG = "\x1b[48:6:0:0:0:180m"
@@ -39,6 +50,7 @@ struct LogLine
 {
 	string text = ""
 	int level = eLogLevel.INFO
+	string color = ""	// optional SGR override for the message text ("" = level colour)
 	float time = 0.0
 }
 
@@ -49,6 +61,10 @@ struct LoggerPlayerState
 	array<LogLine> lines = []
 	bool visible = true
 	bool dirty = false
+	bool blink = false
+	bool blinkBlank = false
+	float blinkNext = 0.0
+	bool lastBlank = false
 }
 
 table<string, LoggerPlayerState> loggerPlayerStates = {}
@@ -86,10 +102,12 @@ void function LoggerThink( entity player )
 		if ( uid in loggerPlayerStates )
 		{
 			LoggerPlayerState state = loggerPlayerStates[ uid ]
-			if ( state.dirty )
+			bool blank = LoggerBlinkBlank( state )
+			if ( state.dirty || blank != state.lastBlank )
 			{
 				state.dirty = false
-				if ( state.visible )
+				state.lastBlank = blank
+				if ( state.visible && !blank )
 					NSSendTUI( player, state.tuiIndex, LoggerRenderFrame( state ) )
 				else
 					NSSendTUI( player, state.tuiIndex, "" )
@@ -99,7 +117,7 @@ void function LoggerThink( entity player )
 	}
 }
 
-void function LOGGER_Log( entity player, string text, int level = eLogLevel.INFO )
+void function LOGGER_Log( entity player, string text, int level = eLogLevel.INFO, string color = "" )
 {
 	if ( level < eLogLevel.DEBUG || level > eLogLevel.ERROR )
 		level = eLogLevel.INFO
@@ -109,6 +127,7 @@ void function LOGGER_Log( entity player, string text, int level = eLogLevel.INFO
 	LogLine line = { ... }
 	line.text = text
 	line.level = level
+	line.color = color
 	line.time = Time()
 
 	state.lines.append( line )
@@ -131,6 +150,47 @@ void function LOGGER_SetVisible( entity player, bool visible )
 	LoggerPlayerState state = LoggerGetState( player )
 	state.visible = visible
 	state.dirty = true
+}
+
+// flashing the whole panel: used while the cockpit is offline, when the log is the last-resort display
+void function LOGGER_SetBlink( entity player, bool blink )
+{
+	LoggerPlayerState state = LoggerGetState( player )
+	if ( state.blink == blink )
+		return
+	state.blink = blink
+	state.blinkBlank = false
+	state.blinkNext = blink ? Time() + RandomFloatRange( LOGGER_BLINK_OFF_MIN, LOGGER_BLINK_OFF_MAX ) : 0.0
+	state.dirty = true
+}
+
+// random flicker: returns true when the panel should be blank this frame
+bool function LoggerBlinkBlank( LoggerPlayerState state )
+{
+	if ( !state.blink )
+		return false
+
+	float now = Time()
+	if ( now < state.blinkNext )
+		return state.blinkBlank
+
+	state.blinkBlank = !state.blinkBlank
+
+	float duration
+	if ( state.blinkBlank )
+	{
+		// mostly short dropouts, now and then a longer one so it reads as a fault rather than a beat
+		duration = ( RandomFloat( 1.0 ) < LOGGER_BLINK_DROPOUT_CHANCE )
+			? RandomFloatRange( LOGGER_BLINK_DROPOUT_MIN, LOGGER_BLINK_DROPOUT_MAX )
+			: RandomFloatRange( LOGGER_BLINK_OFF_MIN, LOGGER_BLINK_OFF_MAX )
+	}
+	else
+	{
+		duration = RandomFloatRange( LOGGER_BLINK_ON_MIN, LOGGER_BLINK_ON_MAX )
+	}
+
+	state.blinkNext = now + duration
+	return state.blinkBlank
 }
 
 LoggerPlayerState function LoggerGetState( entity player )
@@ -175,6 +235,7 @@ array<string> function LoggerWrapLine( LogLine line )
 	string levelPrefix = LoggerLevelPrefix( line.level )
 	string levelFg = LoggerLevelFg( line.level )
 	string levelPrefixFg = LoggerLevelPrefixFg( line.level )
+	string textFg = line.color == "" ? levelFg : line.color
 
 	int prefixWidth = LoggerCalcPrefixWidth( timestamp, levelPrefix )
 
@@ -198,12 +259,12 @@ array<string> function LoggerWrapLine( LogLine line )
 			composed += LOGGER_SGR_BG + LOGGER_SGR_INFO + "["
 			composed += LOGGER_SGR_BG + levelPrefixFg + levelPrefix
 			composed += LOGGER_SGR_BG + LOGGER_SGR_INFO + "]: "
-			composed += LOGGER_SGR_BG + levelFg + textLines[ i ]
+			composed += LOGGER_SGR_BG + textFg + textLines[ i ]
 		}
 		else
 		{
 			composed += LOGGER_SGR_BG + TuiText_Spaces( prefixWidth )
-			composed += LOGGER_SGR_BG + levelFg + textLines[ i ]
+			composed += LOGGER_SGR_BG + textFg + textLines[ i ]
 		}
 
 		composed += LOGGER_SGR_RESET
