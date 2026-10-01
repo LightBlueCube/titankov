@@ -9,6 +9,7 @@ global function TkEject_Init
 struct
 {
 	bool functionref( entity, array<string> ) vanillaEject
+	bool functionref( entity, array<string> ) vanillaDisembark
 } file
 
 void function TkEject_Init()
@@ -19,6 +20,7 @@ void function TkEject_Init()
 	AddCallback_EntitiesDidLoad( TkEjectOnEntitiesDidLoad )
 	AddCallback_OnPilotBecomesTitan( TkEjectOnPilotBecomesTitan )
 	AddCallback_OnTitanBecomesPilot( TkEjectOnTitanBecomesPilot )
+	thread TkDisembarkLockThink()
 }
 
 // runs after every script init, so this lands after GamemodeTTDM_Init sets exit to Never
@@ -31,6 +33,36 @@ void function TkEjectOnEntitiesDidLoad()
 		unreachable
 	file.vanillaEject = svGlobal.clientCommandCallbacks[ "TitanEject" ]
 	svGlobal.clientCommandCallbacks[ "TitanEject" ] = TkEjectCommand
+
+	// walking out of the titan is never allowed; only the doomed eject leaves the cockpit
+	if ( "TitanDisembark" in svGlobal.clientCommandCallbacks )
+	{
+		file.vanillaDisembark = svGlobal.clientCommandCallbacks[ "TitanDisembark" ]
+		svGlobal.clientCommandCallbacks[ "TitanDisembark" ] = TkDisembarkCommand
+	}
+}
+
+// README: no pilot phase - the only way out of a titan is the doomed eject
+bool function TkDisembarkCommand( entity player, array<string> args )
+{
+	return true
+}
+
+// spawn / resupply code can hand titan-exit permission back, so keep it revoked while a titan is alive.
+// DisableTitanExit() is idempotent (it returns early once CanDisembark() is false).
+void function TkDisembarkLockThink()
+{
+	while ( true )
+	{
+		WaitFrame()
+
+		foreach ( entity player in GetPlayerArray() )
+		{
+			if ( !IsValid( player ) || !player.IsTitan() || !IsAlive( player ) )
+				continue
+			DisableTitanExit( player )
+		}
+	}
 }
 
 bool function TkEjectCommand( entity player, array<string> args )

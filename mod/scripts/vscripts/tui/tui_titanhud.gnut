@@ -1,0 +1,834 @@
+untyped
+
+global function TkHud_Init
+
+// ============================================================
+// titankov 泰坦部位状态 HUD（TUI 字符面板，服务端脚本）
+//
+// 纯显示层：所有数据来自 titankov（tk_parts），本文件不参与任何伤害计算。
+// 27 行字符画区域（行/列从 0 起，闭区间，见 HUD_REGIONS / HUD_LABEL_DEFS）：
+//   驾驶舱 COCKPIT = 中央上半（头部 ████ + 躯干 + 胯 V）
+//   反应堆 REACTOR = 裆部小框
+//   左右臂 / 左右腿 = 外侧竖条 / 内侧大腿-小腿-脚掌
+// 每部位颜色绿 -> 红；离线恒红并显示“离线”；电路故障显示 XX；
+// 反应堆失控（TK_IsReactorCritical）：裆部框红闪 + 框内 2 位小数倒计时，
+// 胸口那一行显示“反应核心不稳定”，其余部位保持正常配色。
+// 未重生（无泰坦）时隐藏面板；重生后播放“连接中”动画再显示。
+// ConVar：tk_hud_size / _x / _y / _blink / _style / _lang。
+// ============================================================
+
+// ---------------- 面板参数 ----------------
+const int   HUD_COLS         = 58			// = HUD_ART_COLS + 6
+const int   HUD_ROWS         = 33			// = HUD_ART_ROWS + 6
+const int   HUD_ART_COLS     = 52
+const int   HUD_ART_ROWS     = 27
+const int   HUD_CENTER_ROW   = 13
+const float HUD_X            = 0.88
+const float HUD_Y            = 0.77
+const int   HUD_PRIO         = 48
+const int   HUD_SIZE_DEFAULT = 9
+const float HUD_FLASH_TIME   = 3.0
+const float HUD_BLINK_RATE_DEFAULT = 3.0
+const float HUD_CRITICAL_FRAC = 0.25
+
+// ---------------- 部位（数值与 eTkPart 对齐） ----------------
+const int HUD_REACTOR = 0
+const int HUD_COCKPIT = 1
+const int HUD_LARM    = 2
+const int HUD_RARM    = 3
+const int HUD_LLEG    = 4
+const int HUD_RLEG    = 5
+
+// ---------------- 故障（数值与 eTkFault 对齐） ----------------
+const int HUD_FAULT_HYD  = 0
+const int HUD_FAULT_ELEC = 1
+const int HUD_FAULT_MECH = 2
+
+// ---------------- 颜色 ----------------
+const string HUD_RESET        = "\x1b[0m"
+const string HUD_PANEL_BG     = "\x1b[48:6:18:20:24:120m"
+const string HUD_FRAME_BG     = "\x1b[48;2;170;170;170m"
+const string HUD_SCREEN_BG    = "\x1b[48;2;110;110;110m"
+const string HUD_LED_BG       = "\x1b[48;2;200;80;80m"
+const string HUD_DOOM_FG      = "\x1b[1m\x1b[38;2;255;160;160m"
+const string HUD_DOOM_BG      = "\x1b[48;2;56;0;0m"
+const string HUD_INVALID_FG   = "\x1b[38;2;140;160;172m"
+const string HUD_INVALID_BG   = "\x1b[48;2;28;33;36m"
+
+const string HUD_FRAME_COLOR  = "\x1b[38;2;200;200;200m"
+const string HUD_SCREEN_COLOR = "\x1b[38;2;110;110;110m"
+const string HUD_LED_COLOR    = "\x1b[38;2;200;80;80m"
+const string HUD_CONNECT_COLOR = "\x1b[38;2;0;230;230m"
+
+const string HUD_LABEL_CONNECT     = "连接中"
+const string HUD_LABEL_CONNECT_EN  = "LINKING"
+const string HUD_LABEL_OFFLINE     = "离线"
+const string HUD_LABEL_DOOM        = "反应核心不稳定"
+
+// ---------------- 字符画（27 行，列 0-51） ----------------
+array<string> HUD_ART = [
+	"                     ____________",
+	"                    ╱            ╲",
+	"                   ╱    ╭────╮    ╲",
+	"  ╭──────────╮    │     │████│     │    ╭──────────╮",
+	"  │          │    │     │████│     │    │          │",
+	"  │      ╭───╯    │     ╰────╯     │    ╰───╮      │",
+	"  │      │        │                │        │      │",
+	"  │      │        │                │        │      │",
+	"  │      │        │                │        │      │",
+	"  ╰──────╯         ╲              ╱         ╰──────╯",
+	"   ╭────╮           ╲____________╱          ╭────╮",
+	"   │    │              ╭─────╮              │    │",
+	"   │    │              │     │              │    │",
+	"   │    │   ╭───────╮  │     │  ╭───────╮   │    │",
+	"   ╰────╯   │       │  │     │  │       │   ╰────╯",
+	"   ╭────╮   │       │  │     │  │       │   ╭────╮",
+	"   │    │   │       │  │     │  │       │   │    │",
+	"   ╰─╮  │   │       │  ╰─────╯  │       │   │  ╭─╯",
+	"     ╰──╯   │       │           │       │   ╰──╯",
+	"            ╰───────╯           ╰───────╯",
+	"             ╭────╮                ╭────╮",
+	"             │    │                │    │",
+	"             │    │                │    │",
+	"             │    │                │    │",
+	"             ╰────╯                ╰────╯",
+	"          ╭─────────╮            ╭─────────╮",
+	"          ╰─────────╯            ╰─────────╯"
+]
+
+// 区域：[部位, rowStart, rowEnd, colStart, colEnd]
+array<array<int> > HUD_REGIONS = [
+	[ HUD_COCKPIT, 0, 2, 17, 36 ],
+	[ HUD_COCKPIT, 3, 5, 18, 35 ],
+	[ HUD_COCKPIT, 6, 9, 18, 35 ],
+	[ HUD_COCKPIT, 10, 10, 20, 33 ],
+	[ HUD_REACTOR, 11, 17, 23, 29 ],
+	[ HUD_LARM, 3, 5, 2, 13 ],
+	[ HUD_LARM, 6, 9, 2, 9 ],
+	[ HUD_LARM, 10, 18, 3, 8 ],
+	[ HUD_RARM, 3, 5, 40, 51 ],
+	[ HUD_RARM, 6, 9, 44, 51 ],
+	[ HUD_RARM, 10, 18, 44, 49 ],
+	[ HUD_LLEG, 13, 19, 12, 20 ],
+	[ HUD_LLEG, 20, 24, 13, 18 ],
+	[ HUD_LLEG, 25, 26, 10, 20 ],
+	[ HUD_RLEG, 13, 19, 32, 40 ],
+	[ HUD_RLEG, 20, 24, 35, 40 ],
+	[ HUD_RLEG, 25, 26, 33, 43 ]
+]
+
+// 标签位置：[部位, row, colStart, colEnd]
+array<array<int> > HUD_LABEL_DEFS = [
+	[ HUD_REACTOR, 14, 24, 28 ],
+	[ HUD_COCKPIT, 7, 19, 34 ],
+	[ HUD_LARM, 4, 3, 12 ],
+	[ HUD_RARM, 4, 41, 50 ],
+	[ HUD_LLEG, 16, 13, 19 ],
+	[ HUD_RLEG, 16, 33, 39 ]
+]
+
+// ---------------- 运行时布局 ----------------
+array<array<string> > HUD_CHARS = []			// 每行拆分后的单字符
+array<array<int> >    HUD_KINDS = []			// 每行每列的部位编号，-1 = 装饰
+array<array<int> >    HUD_LABELS_AT_ROW = []	// 每行标签三元组扁平表 [part,c0,c1,...]
+
+// 静态画面缓存（内容与玩家无关，只构建一次）
+array<string> hudScreenConnect = []
+bool hudScreensReady = false
+int hudScreensStyle = -1
+int hudScreensLang = -1
+
+struct
+{
+	table<entity, int>    tuiIdx
+	table<entity, string> tuiCfg
+	table<entity, string> lastKey
+	table<entity, int>    hudState
+	table<entity, float>  stateEnd
+} file
+
+float hudLastSweep = 0.0
+float hudLastErrLog = 0.0
+
+// ============================================================
+// 初始化
+// ============================================================
+void function TkHud_Init()
+{
+	if ( GAMETYPE != TITAN_BRAWL )
+		return
+
+	if ( HUD_ART.len() != HUD_ART_ROWS )
+		printt( format( "[tui.titanhud] art rows = %d (expect %d)", HUD_ART.len(), HUD_ART_ROWS ) )
+
+	HudBuildLayout()
+
+	AddCallback_OnClientDisconnected( HudOnPlayerDisconnected )
+	thread HudThink()
+}
+
+void function HudBuildLayout()
+{
+	HUD_CHARS.clear()
+	HUD_KINDS.clear()
+	HUD_LABELS_AT_ROW.clear()
+
+	for ( int r = 0; r < HUD_ART_ROWS; r++ )
+	{
+		array<string> chars = TuiText_SplitChars( r < HUD_ART.len() ? HUD_ART[ r ] : "" )
+		while ( chars.len() < HUD_ART_COLS )
+			chars.append( " " )
+		HUD_CHARS.append( chars )
+
+		array<int> kinds = []
+		for ( int c = 0; c < HUD_ART_COLS; c++ )
+			kinds.append( -1 )
+		HUD_KINDS.append( kinds )
+
+		array<int> empty = []
+		HUD_LABELS_AT_ROW.append( empty )
+	}
+
+	foreach ( array<int> reg in HUD_REGIONS )
+	{
+		for ( int r = reg[ 1 ]; r <= reg[ 2 ]; r++ )
+		{
+			if ( r < 0 || r >= HUD_ART_ROWS )
+				continue
+			for ( int c = reg[ 3 ]; c <= reg[ 4 ]; c++ )
+			{
+				if ( c < 0 || c >= HUD_ART_COLS )
+					continue
+				HUD_KINDS[ r ][ c ] = reg[ 0 ]
+			}
+		}
+	}
+
+	foreach ( array<int> lab in HUD_LABEL_DEFS )
+	{
+		int row = lab[ 1 ]
+		if ( row < 0 || row >= HUD_ART_ROWS )
+			continue
+		HUD_LABELS_AT_ROW[ row ].append( lab[ 0 ] )
+		HUD_LABELS_AT_ROW[ row ].append( lab[ 2 ] )
+		HUD_LABELS_AT_ROW[ row ].append( lab[ 3 ] )
+	}
+}
+
+void function HudThink()
+{
+	while ( true )
+	{
+		WaitFrame()
+
+		if ( Time() - hudLastSweep >= 30.0 )
+		{
+			hudLastSweep = Time()
+			HudSweepStates()
+		}
+
+		array<entity> players = GetPlayerArray()
+		foreach ( entity player in players )
+		{
+			if ( !IsValid( player ) )
+				continue
+			try
+			{
+				HudUpdatePlayer( player )
+			}
+			catch ( e )
+			{
+				if ( Time() - hudLastErrLog >= 5.0 )
+				{
+					hudLastErrLog = Time()
+					printt( "[tui.titanhud] update error: " + e )
+				}
+			}
+		}
+	}
+}
+
+// ---------------- 每帧刷新 ----------------
+void function HudUpdatePlayer( entity player )
+{
+	// 目标泰坦：自身泰坦，或机师携带的宠物泰坦（宠物无 titankov 数据时按满血兜底显示）
+	entity target = null
+	if ( player.IsTitan() && IsAlive( player ) )
+	{
+		target = player
+	}
+	else
+	{
+		entity pet = player.GetPetTitan()
+		if ( IsValid( pet ) && IsAlive( pet ) )
+			target = pet
+	}
+
+	float now = Time()
+	int state = HudSlotInt( file.hudState, player, 0 )
+
+	// 状态机：0=隐藏（未重生）1=连接中（动画）2=正常
+	if ( IsValid( target ) )
+	{
+		if ( state == 0 || state == 3 )
+		{
+			state = 1
+			HudStoreFloat( file.stateEnd, player, now + HUD_FLASH_TIME )
+		}
+		else if ( state == 1 && now >= HudSlotFloat( file.stateEnd, player, 0.0 ) )
+		{
+			state = 2
+		}
+	}
+	else
+	{
+		state = 0
+	}
+
+	HudStoreInt( file.hudState, player, state )
+
+	// 面板参数（字号 / 位置）变化 -> 重建
+	int size = HudSize()
+	float posX = HudConVarFloat( "tk_hud_x", HUD_X )
+	float posY = HudConVarFloat( "tk_hud_y", HUD_Y )
+	string cfg = format( "%d|%f|%f", size, posX, posY )
+	if ( !( player in file.tuiCfg ) || file.tuiCfg[ player ] != cfg )
+	{
+		if ( player in file.tuiIdx && file.tuiIdx[ player ] >= 0 )
+		{
+			NSDestroyTUI( player, file.tuiIdx[ player ] )
+			HudStoreInt( file.tuiIdx, player, -1 )
+		}
+		HudStoreString( file.tuiCfg, player, cfg )
+	}
+
+	if ( !( player in file.tuiIdx ) || file.tuiIdx[ player ] < 0 )
+	{
+		int idx = NSCreateTUI( player, HUD_COLS, HUD_ROWS, size, posX, posY, HUD_PRIO )
+		HudStoreInt( file.tuiIdx, player, idx )
+		if ( player in file.lastKey )
+			delete file.lastKey[ player ]
+	}
+	if ( file.tuiIdx[ player ] < 0 )
+		return
+
+	HudEnsureScreens()
+
+	// 数据状态
+	bool active = HudActive( player )
+	bool critical = state == 2 && active && TK_IsReactorCritical( player )
+
+	bool anyLow = false
+	if ( state == 2 && active )
+	{
+		for ( int part = 0; part < 6; part++ )
+		{
+			if ( HudOffline( player, part ) )
+				continue
+			if ( HudFrac( player, part ) < HUD_CRITICAL_FRAC )
+				anyLow = true
+		}
+	}
+	bool needBlink = critical || anyLow
+	int phase = 0
+	if ( state == 2 )
+		phase = needBlink ? int( now * HudBlinkRate() ) % 2 : 0
+	else if ( state == 1 )
+		phase = int( now * HudBlinkRate() ) % 5
+
+	// 画面指纹：内容确实变化时才组帧推送；面板常显时每 5 秒强制重发一次
+	int resend = ( state == 2 ) ? int( now / 5.0 ) : 0
+	string key = format( "%d|%d|%d|%d|%s", HudBlockStyle() ? 1 : 0, HudLang(), resend, state, HudFrameKey( player, state, critical, phase ) )
+	if ( player in file.lastKey && file.lastKey[ player ] == key )
+		return
+	HudStoreString( file.lastKey, player, key )
+
+	// state 0：未重生；驾驶舱离线：面板让位给 ECAM / 日志 -> 发送空串隐藏
+	string text = ""
+	if ( state == 2 )
+	{
+		if ( !HudCockpitDown( player ) )
+			text = HudBuildPanel( player, phase, critical )
+	}
+	else if ( state == 1 )
+		text = hudScreenConnect[ phase % hudScreenConnect.len() ]
+
+	NSSendTUI( player, file.tuiIdx[ player ], text )
+}
+
+string function HudFrameKey( entity player, int state, bool critical, int phase )
+{
+	if ( state != 2 )
+		return format( "%d|%d", state, phase )
+
+	string key = "2"
+	for ( int part = 0; part < 6; part++ )
+	{
+		key += format( "|%d,%d,%d,%d,%d",
+			int( HudFrac( player, part ) * 100.0 ),
+			HudOffline( player, part ) ? 1 : 0,
+			HudFault( player, part, HUD_FAULT_ELEC ) ? 1 : 0,
+			HudFault( player, part, HUD_FAULT_HYD ) ? 1 : 0,
+			HudFault( player, part, HUD_FAULT_MECH ) ? 1 : 0 )
+	}
+	if ( critical )
+		key += format( "|c%d", int( Time() * 20.0 ) )	// 倒计时 20Hz 刷新
+	key += format( "|p%d", phase )
+	return key
+}
+
+// ---------------- 数据读取（全部经 titankov，未激活时安全兜底） ----------------
+bool function HudActive( entity player )
+{
+	return TK_GetLifeId( player ) != 0
+}
+
+float function HudFrac( entity player, int part )
+{
+	if ( !HudActive( player ) )
+		return 1.0
+	return TK_GetPartFrac( player, part )
+}
+
+bool function HudOffline( entity player, int part )
+{
+	return HudActive( player ) && TK_IsPartOffline( player, part )
+}
+
+bool function HudFault( entity player, int part, int fault )
+{
+	if ( !HudActive( player ) || part == HUD_REACTOR )
+		return false
+	return TK_HasFault( player, part, fault )
+}
+
+bool function HudDataValid( entity player, int part )
+{
+	return !HudFault( player, part, HUD_FAULT_ELEC )
+}
+
+// README: cockpit offline -> the part HUD stands down, ECAM / log take over
+bool function HudCockpitDown( entity player )
+{
+	return HudActive( player ) && TK_IsPartOffline( player, HUD_COCKPIT )
+}
+
+// ---------------- 组帧 ----------------
+string function HudBuildPanel( entity player, int phase, bool critical )
+{
+	string out = ""
+	out += HudPanelTop() + "\n"
+	out += HudFrameRow( TuiText_Spaces( HUD_ART_COLS ) ) + "\n"
+	for ( int row = 0; row < HUD_ART_ROWS; row++ )
+		out += HudFrameRow( HudEmitRow( player, row, phase, critical ) ) + "\n"
+	out += HudFrameRow( TuiText_Spaces( HUD_ART_COLS ) ) + "\n"
+	out += HudPanelBottom()
+	return out
+}
+
+// 行内若有标签，则用标签文本替换该段（含框内空格），其余字符按部位上色
+string function HudEmitRow( entity player, int row, int phase, bool critical )
+{
+	array<int> segs = HUD_LABELS_AT_ROW[ row ]
+	if ( segs.len() == 0 )
+		return HudEmitRange( player, row, 0, HUD_ART_COLS - 1, phase, critical )
+
+	string out = ""
+	int cur = 0
+	for ( int i = 0; i + 3 <= segs.len(); i += 3 )
+	{
+		int part = segs[ i ]
+		int c0 = segs[ i + 1 ]
+		int c1 = segs[ i + 2 ]
+
+		out += HudEmitRange( player, row, cur, c0 - 1, phase, critical )
+		string text = HudFit( HudLabelText( player, part, critical ), c1 - c0 + 1 )
+		out += HudLabelColor( player, part, phase, critical ) + text + HUD_RESET
+		cur = c1 + 1
+	}
+	out += HudEmitRange( player, row, cur, HUD_ART_COLS - 1, phase, critical )
+	return out
+}
+
+// 连续同部位合并为一个 SGR 段
+string function HudEmitRange( entity player, int row, int from, int to, int phase, bool critical )
+{
+	if ( to < from )
+		return ""
+
+	string out = ""
+	int runKind = -2
+	for ( int c = from; c <= to; c++ )
+	{
+		int kind = HUD_KINDS[ row ][ c ]
+		if ( kind != runKind )
+		{
+			out += ( kind < 0 ) ? HUD_PANEL_BG : HudPartColor( player, kind, phase, critical )
+			runKind = kind
+		}
+		out += HUD_CHARS[ row ][ c ]
+	}
+	return out
+}
+
+// ---------------- 颜色 ----------------
+string function HudRGB( int r, int g, int b )
+{
+	return format( "\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm", r, g, b, int( r * 0.22 ), int( g * 0.22 ), int( b * 0.22 ) )
+}
+
+string function HudPartColor( entity player, int part, int phase, bool critical )
+{
+	// 电路故障：数据无效，整个部位转为灰蓝
+	if ( HudActive( player ) && part != HUD_REACTOR && HudFault( player, part, HUD_FAULT_ELEC ) )
+		return HUD_INVALID_FG + HUD_INVALID_BG
+
+	// 反应堆失控：裆部框红闪
+	if ( part == HUD_REACTOR && critical )
+		return ( phase == 1 ) ? HudRGB( 96, 18, 18 ) : HudRGB( 255, 60, 60 )
+
+	if ( HudOffline( player, part ) )
+		return HudRGB( 255, 0, 0 )
+
+	float frac = HudFrac( player, part )
+	if ( frac < 0.0 )
+		frac = 0.0
+	if ( frac > 1.0 )
+		frac = 1.0
+
+	int r = int( 255.0 * ( 1.0 - frac ) )
+	int g = int( 255.0 * frac )
+
+	if ( frac < HUD_CRITICAL_FRAC )
+	{
+		if ( phase == 1 )
+			return HudRGB( int( r * 0.45 ), int( g * 0.45 ), 0 )
+		return "\x1b[1m" + HudRGB( r, g, 0 )
+	}
+	return HudRGB( r, g, 0 )
+}
+
+string function HudLabelColor( entity player, int part, int phase, bool critical )
+{
+	// 胸口那一行：反应堆失控时显示“反应核心不稳定”
+	if ( part == HUD_COCKPIT && critical )
+		return HUD_DOOM_BG + HUD_DOOM_FG
+	return HudPartColor( player, part, phase, critical )
+}
+
+// ---------------- 标签文本 ----------------
+string function HudLabelText( entity player, int part, bool critical )
+{
+	if ( part == HUD_COCKPIT && critical )
+		return HUD_LABEL_DOOM
+
+	if ( part == HUD_REACTOR )
+	{
+		if ( critical )
+			return HudFormat2( TK_GetMeltdownLeft( player ) )
+		return HudPct( player, HUD_REACTOR )
+	}
+
+	if ( !HudActive( player ) )
+		return HudPct( player, part )
+	if ( !HudDataValid( player, part ) )
+		return "XX"
+	if ( HudOffline( player, part ) )
+		return HUD_LABEL_OFFLINE
+
+	string text = HudPct( player, part )
+	if ( HudFault( player, part, HUD_FAULT_MECH ) )
+		text += " J"
+	else if ( HudFault( player, part, HUD_FAULT_HYD ) )
+		text += " H"
+	return text
+}
+
+string function HudPct( entity player, int part )
+{
+	float frac = HudFrac( player, part )
+	if ( frac < 0.0 )
+		frac = 0.0
+	if ( frac > 1.0 )
+		frac = 1.0
+	return format( "%d%%", int( frac * 100.0 + 0.5 ) )
+}
+
+// 2 位小数（不依赖 %f）
+string function HudFormat2( float v )
+{
+	if ( v < 0.0 )
+		v = 0.0
+	int cs = int( v * 100.0 + 0.5 )
+	return format( "%d.%02d", cs / 100, cs % 100 )
+}
+
+// 居中并裁到指定显示宽度（含 CJK 宽字符）
+string function HudFit( string text, int width )
+{
+	array<string> chars = TuiText_SplitChars( text )
+	int w = 0
+	string body = ""
+	foreach ( string ch in chars )
+	{
+		int cw = TuiText_CharWidth( ch )
+		if ( w + cw > width )
+			break
+		body += ch
+		w += cw
+	}
+	int left = ( width - w ) / 2
+	int right = width - w - left
+	return TuiText_Spaces( left ) + body + TuiText_Spaces( right )
+}
+
+// ---------------- 外框 / 静态画面 ----------------
+string function HudPanelTop()
+{
+	if ( HudBlockStyle() )
+	{
+		string out = HUD_FRAME_BG + TuiText_Spaces( HUD_COLS ) + HUD_RESET + "\n"
+		out += HUD_FRAME_BG + " " + HUD_RESET + " " + HUD_SCREEN_BG + TuiText_Spaces( HUD_ART_COLS + 2 ) + HUD_RESET + " " + HUD_FRAME_BG + " " + HUD_RESET
+		return out
+	}
+
+	string out = HUD_FRAME_COLOR + "╔" + TuiText_Repeat( "═", HUD_COLS - 2 ) + "╗" + HUD_RESET + "\n"
+	out += HUD_FRAME_COLOR + "║ " + HUD_SCREEN_COLOR + "┌" + TuiText_Repeat( "─", HUD_ART_COLS ) + "┐" + HUD_FRAME_COLOR + " ║" + HUD_RESET
+	return out
+}
+
+string function HudPanelBottom()
+{
+	if ( HudBlockStyle() )
+	{
+		string out = HUD_FRAME_BG + " " + HUD_RESET + " " + HUD_SCREEN_BG + TuiText_Spaces( HUD_ART_COLS + 2 ) + HUD_RESET + " " + HUD_FRAME_BG + " " + HUD_RESET + "\n"
+		out += HUD_FRAME_BG + TuiText_Spaces( HUD_COLS - 6 ) + HUD_LED_BG + " " + HUD_FRAME_BG + TuiText_Spaces( 5 ) + HUD_RESET
+		return out
+	}
+
+	string out = HUD_FRAME_COLOR + "║ " + HUD_SCREEN_COLOR + "└" + TuiText_Repeat( "─", HUD_ART_COLS ) + "┘" + HUD_FRAME_COLOR + " ║" + HUD_RESET + "\n"
+	out += HUD_FRAME_COLOR + "╚" + TuiText_Repeat( "═", HUD_COLS - 7 ) + HUD_LED_COLOR + "●" + HUD_FRAME_COLOR + TuiText_Repeat( "═", 4 ) + "╝" + HUD_RESET
+	return out
+}
+
+string function HudFrameRow( string inner )
+{
+	if ( HudBlockStyle() )
+		return HUD_FRAME_BG + " " + HUD_RESET + " " + HUD_SCREEN_BG + " " + HUD_PANEL_BG + inner + HUD_RESET + HUD_SCREEN_BG + " " + HUD_RESET + " " + HUD_FRAME_BG + " " + HUD_RESET
+	return HUD_FRAME_COLOR + "║ " + HUD_SCREEN_COLOR + "│" + HUD_PANEL_BG + inner + HUD_RESET + HUD_SCREEN_COLOR + "│" + HUD_FRAME_COLOR + " ║" + HUD_RESET
+}
+
+string function HudBuildSignal( string label, string color )
+{
+	string out = ""
+	out += HudPanelTop() + "\n"
+	out += HudFrameRow( TuiText_Spaces( HUD_ART_COLS ) ) + "\n"
+
+	int width = TuiText_Width( label )
+	int left = ( HUD_ART_COLS - width ) / 2
+	int right = HUD_ART_COLS - left - width
+
+	for ( int row = 0; row < HUD_ART_ROWS; row++ )
+	{
+		string inner = TuiText_Spaces( HUD_ART_COLS )
+		if ( row == HUD_CENTER_ROW && label != "" )
+			inner = HUD_PANEL_BG + TuiText_Spaces( left ) + color + label + TuiText_Spaces( right )
+		out += HudFrameRow( inner ) + "\n"
+	}
+	out += HudFrameRow( TuiText_Spaces( HUD_ART_COLS ) ) + "\n"
+	out += HudPanelBottom()
+	return out
+}
+
+void function HudEnsureScreens()
+{
+	int style = HudBlockStyle() ? 1 : 0
+	int lang = HudLang()
+	if ( hudScreensReady && hudScreensStyle == style && hudScreensLang == lang )
+		return
+	hudScreensReady = true
+	hudScreensStyle = style
+	hudScreensLang = lang
+
+	string labelConnect = lang == 1 ? HUD_LABEL_CONNECT : HUD_LABEL_CONNECT_EN
+
+	hudScreenConnect = [
+		HudBuildSignal( "", HUD_CONNECT_COLOR ),
+		HudBuildSignal( labelConnect, HUD_CONNECT_COLOR ),
+		HudBuildSignal( labelConnect + ".", HUD_CONNECT_COLOR ),
+		HudBuildSignal( labelConnect + "..", HUD_CONNECT_COLOR ),
+		HudBuildSignal( labelConnect + "...", HUD_CONNECT_COLOR )
+	]
+}
+
+// ---------------- ConVar ----------------
+int function HudSize()
+{
+	int size = HUD_SIZE_DEFAULT
+	try
+	{
+		size = GetConVarInt( "tk_hud_size" )
+	}
+	catch ( e )
+	{
+		return HUD_SIZE_DEFAULT
+	}
+	if ( size <= 0 )
+		return HUD_SIZE_DEFAULT
+	return size
+}
+
+float function HudConVarFloat( string name, float def )
+{
+	string raw = ""
+	try
+	{
+		raw = GetConVarString( name )
+	}
+	catch ( e )
+	{
+		return def
+	}
+	if ( raw == "" )
+		return def
+	return raw.tofloat()
+}
+
+int function HudBlinkRate()
+{
+	int rate = int( HUD_BLINK_RATE_DEFAULT )
+	try
+	{
+		rate = GetConVarInt( "tk_hud_blink" )
+	}
+	catch ( e )
+	{
+		return int( HUD_BLINK_RATE_DEFAULT )
+	}
+	if ( rate <= 0 )
+		return int( HUD_BLINK_RATE_DEFAULT )
+	return rate
+}
+
+// 状态文字语言：0=英文 1=中文（默认）
+int function HudLang()
+{
+	int lang = 1
+	try
+	{
+		lang = GetConVarInt( "tk_hud_lang" )
+	}
+	catch ( e )
+	{
+		return 1
+	}
+	return lang == 0 ? 0 : 1
+}
+
+// 样式：0=线条（依赖客户端字体框线字形）1=方块（背景色块，任何字体都是实心）
+bool function HudBlockStyle()
+{
+	int style = 1
+	try
+	{
+		style = GetConVarInt( "tk_hud_style" )
+	}
+	catch ( e )
+	{
+		return true
+	}
+	return style != 0
+}
+
+// ---------------- 状态存取 ----------------
+void function HudOnPlayerDisconnected( entity player )
+{
+	if ( player in file.tuiIdx ) delete file.tuiIdx[ player ]
+	if ( player in file.tuiCfg ) delete file.tuiCfg[ player ]
+	if ( player in file.lastKey ) delete file.lastKey[ player ]
+	if ( player in file.hudState ) delete file.hudState[ player ]
+	if ( player in file.stateEnd ) delete file.stateEnd[ player ]
+}
+
+void function HudSweepStates()
+{
+	HudSweepInt( file.tuiIdx )
+	HudSweepInt( file.hudState )
+	HudSweepString( file.tuiCfg )
+	HudSweepString( file.lastKey )
+	HudSweepFloat( file.stateEnd )
+}
+
+void function HudSweepInt( table<entity, int> store )
+{
+	array<entity> stale = []
+	foreach ( key, value in store )
+	{
+		if ( !IsValid( key ) )
+			stale.append( key )
+	}
+	foreach ( entity key in stale )
+		delete store[ key ]
+}
+
+void function HudSweepString( table<entity, string> store )
+{
+	array<entity> stale = []
+	foreach ( key, value in store )
+	{
+		if ( !IsValid( key ) )
+			stale.append( key )
+	}
+	foreach ( entity key in stale )
+		delete store[ key ]
+}
+
+void function HudSweepFloat( table<entity, float> store )
+{
+	array<entity> stale = []
+	foreach ( key, value in store )
+	{
+		if ( !IsValid( key ) )
+			stale.append( key )
+	}
+	foreach ( entity key in stale )
+		delete store[ key ]
+}
+
+int function HudSlotInt( table<entity, int> slot, entity player, int def )
+{
+	if ( !( player in slot ) )
+		slot[ player ] <- def
+	return slot[ player ]
+}
+
+float function HudSlotFloat( table<entity, float> slot, entity player, float def )
+{
+	if ( !( player in slot ) )
+		slot[ player ] <- def
+	return slot[ player ]
+}
+
+void function HudStoreInt( table<entity, int> store, entity player, int value )
+{
+	if ( player in store )
+		store[ player ] = value
+	else
+		store[ player ] <- value
+}
+
+void function HudStoreFloat( table<entity, float> store, entity player, float value )
+{
+	if ( player in store )
+		store[ player ] = value
+	else
+		store[ player ] <- value
+}
+
+void function HudStoreString( table<entity, string> store, entity player, string value )
+{
+	if ( player in store )
+		store[ player ] = value
+	else
+		store[ player ] <- value
+}

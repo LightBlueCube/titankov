@@ -14,9 +14,10 @@ const float ANN_POS_Y = 0.58
 const int ANN_PRIORITY = 52
 
 const float MAINT_HOLD_TIME = 0.4
-const float MAINT_TIME_RESET = 6.0
-const float MAINT_TIME_KIT = 4.0
-const float MAINT_TIME_SPARE = 8.0
+// repair durations, 25% of the design values (reset 6s / maint kit 4s / spare pack 8s)
+const float MAINT_TIME_RESET = 1.5
+const float MAINT_TIME_KIT = 1.0
+const float MAINT_TIME_SPARE = 2.0
 const float MAINT_MSG_TIME = 2.5
 const int MAINT_BAR_CELLS = 12
 

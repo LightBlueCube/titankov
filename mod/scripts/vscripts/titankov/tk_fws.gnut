@@ -18,6 +18,26 @@ const float FWS_IMPACT_LOG_INTERVAL = 1.0
 const float FWS_IMPACT_LOG_MIN_DROP = 0.03
 const float FWS_REACTOR_LOW_FRAC = 0.35
 
+// titan offhand abilities whose cooldown completion is announced in the log
+// (OFFHAND_SPECIAL = tactical / defensive, ORDNANCE = ordnance, ANTIRODEO = anti-rodeo utility)
+// OFFHAND_EQUIPMENT is deliberately absent: on a titan that slot holds the CORE weapon
+// (_passives.gnut / _utility_shared.nut read the core from it) and the core has its own line.
+array<int> FWS_ABILITY_SLOTS = [ OFFHAND_SPECIAL, OFFHAND_ORDNANCE, OFFHAND_ANTIRODEO ]
+
+// logger message colours: titan core = black backdrop + bold yellow, ability = blue
+const string FWS_LOG_CORE = "\x1b[48;2;0;0;0m\x1b[1m\x1b[38;2;255;214;0m"
+const string FWS_LOG_ABILITY = "\x1b[38;2;88;166;255m"
+
+// The server cannot localize (Localize() is client-only) and the repo only ships Traditional Chinese
+// overrides, so the in-game Simplified names are listed here, keyed by weapon class name.
+// Class names come from Northstar.CustomServers/.../datatable/titan_properties.csv
+// (ordnance / special / antirodeo columns) - adjust any name that does not match your client.
+table<string, string> FWS_ABILITY_NAMES = {}
+
+// abilities whose ready line would only be noise: the tracker rockets and the sword block come back
+// almost instantly and Legion's mode switch is toggled constantly, so they are never announced.
+table<string, bool> FWS_ABILITY_SILENT = {}
+
 const int FWS_MODE_NORMAL = 0
 const int FWS_MODE_REBOOT = 1
 
@@ -72,6 +92,9 @@ struct FwsState
 	table<string, FwsShown> shown = {}
 	table<string, string> memos = {}
 	array<FwsPartSnap> snaps = []
+	table<int, float> offhandReady = {}
+	bool coreReady = true
+	bool cockpitDown = false
 	float lastImpactLog = -99.0
 	float lastEjectFail = -99.0
 	table<int, FwsAction> actions = {}
@@ -92,6 +115,8 @@ void function TkFws_Init()
 {
 	if ( GAMETYPE != TITAN_BRAWL )
 		return
+
+	FwsBuildAbilityNames()
 
 	RegisterSignal( "TkFwsStop" )
 	AddCallback_OnClientConnected( FwsOnClientConnected )
@@ -178,6 +203,10 @@ void function FwsResetDisplay( entity player, FwsState state )
 	state.kitRows = []
 	state.spareRows = []
 	state.maintTexts = {}
+	state.offhandReady = {}
+	state.coreReady = true
+	state.cockpitDown = false
+	LOGGER_SetBlink( player, false )
 }
 
 void function FwsUpdate( entity player, FwsState state )
@@ -194,7 +223,15 @@ void function FwsUpdate( entity player, FwsState state )
 	}
 
 	FwsLog( player, state )
+	FwsLogAbilities( player, state )
 
+	// cockpit offline: the part HUD stands down and the log blinks as the last-resort display
+	bool cockpitDown = TK_IsPartOffline( player, eTkPart.COCKPIT )
+	if ( cockpitDown != state.cockpitDown )
+	{
+		state.cockpitDown = cockpitDown
+		LOGGER_SetBlink( player, cockpitDown )
+	}
 	if ( mode == FWS_MODE_REBOOT )
 	{
 		FwsSetMemo( player, state, "0_RESET", "SYS RESET IN PROG 主系统重启中", eEcamSeverity.CAUTION )
@@ -393,13 +430,13 @@ string function FwsOfflineEffect( int partId )
 	switch ( partId )
 	{
 		case eTkPart.COCKPIT:
-			return "仅防御技能可用 弹射可能失效"
+			return "辅助武器启用备用法则 弹射不可靠"
 		case eTkPart.LEFT_ARM:
 		case eTkPart.RIGHT_ARM:
-			return "近战伤害下降"
+			return "近战力量下降"
 		case eTkPart.LEFT_LEG:
 		case eTkPart.RIGHT_LEG:
-			return "移动速度下降"
+			return "移动能力减弱"
 	}
 	unreachable
 }
@@ -597,6 +634,156 @@ int function FwsFaultMask( entity player, int partId )
 	if ( TK_HasFault( player, partId, eTkFault.MECH ) )
 		mask = mask | FWS_MASK_MECH
 	return mask
+}
+
+// ---- ability cooldowns: announce readiness in the log (the native HUD is hidden) ----
+
+void function FwsLogAbilities( entity player, FwsState state )
+{
+	foreach ( int slot in FWS_ABILITY_SLOTS )
+	{
+		entity weapon = player.GetOffhandWeapon( slot )
+		if ( !IsValid( weapon ) )
+			continue
+		if ( FwsOffhandSilent( weapon ) )
+			continue
+
+		bool ready = FwsOffhandReady( weapon )
+		bool first = !( slot in state.offhandReady )
+		float was = first ? -1.0 : state.offhandReady[ slot ]
+		if ( first )
+			state.offhandReady[ slot ] <- ready ? 1.0 : 0.0	// typed table: create the slot first
+		else
+			state.offhandReady[ slot ] = ready ? 1.0 : 0.0
+
+		if ( first || !ready || was == 1.0 )
+			continue	// announce only on the not-ready -> ready edge
+
+		LOGGER_Log( player, "[SYS] " + FwsOffhandName( weapon ) + " 就绪 READY", eLogLevel.INFO, FWS_LOG_ABILITY )
+	}
+
+	entity soul = player.GetTitanSoul()
+	if ( !IsValid( soul ) )
+		return
+
+	bool coreReady = true
+	try
+	{
+		coreReady = IsCoreChargeAvailable( player, soul )
+	}
+	catch ( e )
+	{
+		return	// engine global missing: keep the log thread alive
+	}
+	if ( coreReady && !state.coreReady )
+		LOGGER_Log( player, "[SYS] 泰坦核心 就绪 CORE READY", eLogLevel.INFO, FWS_LOG_CORE )
+	state.coreReady = coreReady
+}
+
+// mirrors the vanilla cooldown model (weapon_utility StoreOffhandData): ammo clip or charge fraction
+bool function FwsOffhandReady( entity weapon )
+{
+	switch ( FwsWeaponField( weapon, "cooldown_type" ) )
+	{
+		case "chargeFrac":
+			return weapon.GetWeaponChargeFraction() >= 1.0
+
+		case "ammo":
+		case "ammo_instant":
+		case "ammo_deployed":
+		case "ammo_timed":
+			if ( weapon.IsWeaponRegenDraining() )
+				return false
+			return weapon.GetWeaponPrimaryClipCount() >= weapon.GetWeaponPrimaryClipCountMax()
+	}
+	return false
+}
+
+void function FwsBuildAbilityNames()
+{
+	// ordnance
+	FWS_ABILITY_NAMES[ "mp_titanweapon_shoulder_rockets" ] <- "肩部火箭"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_tracker_rockets" ] <- "追踪火箭"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_flame_wall" ] <- "火焰墙"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_laser_lite" ] <- "激光射击"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_arc_wave" ] <- "电弧波"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_dumbfire_rockets" ] <- "集束导弹"
+	FWS_ABILITY_NAMES[ "mp_titanability_power_shot" ] <- "强力射击"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_salvo_rockets" ] <- "火箭齐射"
+
+	// tactical / defensive
+	FWS_ABILITY_NAMES[ "mp_titanweapon_vortex_shield" ] <- "涡旋护盾"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_vortex_shield_ion" ] <- "涡旋护盾"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_heat_shield" ] <- "热能护盾"
+	FWS_ABILITY_NAMES[ "mp_titanability_particle_wall" ] <- "粒子护盾"
+	FWS_ABILITY_NAMES[ "mp_titanability_basic_block" ] <- "剑刃格挡"
+	FWS_ABILITY_NAMES[ "mp_titanability_gun_shield" ] <- "枪盾"
+	FWS_ABILITY_NAMES[ "mp_titanweapon_stun_laser" ] <- "能量虹吸"
+
+	// utility / anti-rodeo
+	FWS_ABILITY_NAMES[ "mp_titanability_smoke" ] <- "电子烟雾"
+	FWS_ABILITY_NAMES[ "mp_titanability_sonar_pulse" ] <- "声纳脉冲"
+	FWS_ABILITY_NAMES[ "mp_titanability_slow_trap" ] <- "燃烧陷阱"
+	FWS_ABILITY_NAMES[ "mp_titanability_laser_trip" ] <- "激光绊雷"
+	FWS_ABILITY_NAMES[ "mp_titanability_phase_dash" ] <- "相位冲刺"
+	FWS_ABILITY_NAMES[ "mp_titanability_hover" ] <- "悬停"
+	FWS_ABILITY_NAMES[ "mp_titanability_ammo_swap" ] <- "弹药切换"
+	FWS_ABILITY_NAMES[ "mp_titanability_rearm" ] <- "重新武装"
+
+	// these three are never announced when they come back up (see FWS_ABILITY_SILENT)
+	FWS_ABILITY_SILENT[ "mp_titanweapon_tracker_rockets" ] <- true
+	FWS_ABILITY_SILENT[ "mp_titanability_basic_block" ] <- true
+	FWS_ABILITY_SILENT[ "mp_titanability_ammo_swap" ] <- true
+}
+
+// true when this ability should stay off the ready log
+bool function FwsOffhandSilent( entity weapon )
+{
+	return ( weapon.GetWeaponClassName() in FWS_ABILITY_SILENT )
+}
+
+string function FwsOffhandName( entity weapon )
+{
+	string className = weapon.GetWeaponClassName()
+	if ( className in FWS_ABILITY_NAMES )
+		return FWS_ABILITY_NAMES[ className ]
+
+	string name = FwsWeaponField( weapon, "shortprintname" )
+	if ( name == "" )
+		name = FwsWeaponField( weapon, "printname" )
+	if ( name == "" )
+		return weapon.GetWeaponClassName()
+	return FwsTidyToken( name )
+}
+
+// Localize() only exists in the client VM, so the server log shows a tidied raw printname token
+// (#WPN_VORTEX_SHIELD -> VORTEX SHIELD)
+string function FwsTidyToken( string token )
+{
+	if ( token.len() > 0 && token.slice( 0, 1 ) == "#" )
+		token = token.slice( 1, token.len() )
+	if ( token.len() >= 4 && token.slice( 0, 4 ) == "WPN_" )
+		token = token.slice( 4, token.len() )
+
+	string out = ""
+	foreach ( string part in split( token, "_" ) )
+	{
+		if ( part == "" )
+			continue
+		if ( out != "" )
+			out += " "
+		out += part
+	}
+	return out
+}
+
+string function FwsWeaponField( entity weapon, string field )
+{
+	var value = weapon.GetWeaponInfoFileKeyField( field )
+	if ( value == null )
+		return ""
+	string text = string( value )
+	return text == "null" ? "" : text
 }
 
 // ---- MAINT folder: persistent, collapsed; SYS RESET + one folder per consumable, one row per part ----

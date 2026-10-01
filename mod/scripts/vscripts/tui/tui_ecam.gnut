@@ -6,6 +6,7 @@ global function ECAM_SetSeverity
 global function ECAM_Complete
 global function ECAM_Reopen
 global function ECAM_Collapse
+global function ECAM_CollapseAll
 global function ECAM_Delete
 global function ECAM_Clear
 global function ECAM_SetMemo
@@ -37,7 +38,7 @@ global enum eEcamSeverity
 const int ECAM_COLS = 60
 const int ECAM_ROWS = 34
 const int ECAM_FONT_SIZE = 24
-const float ECAM_POS_X = 0.3
+const float ECAM_POS_X = 0.28
 const float ECAM_POS_Y = 0.26
 const int ECAM_PRIORITY = 50
 
@@ -284,6 +285,23 @@ void function ECAM_Collapse( entity player, int index, bool collapsed = true )
 	state.dirty = true
 }
 
+// fold every open folder back up
+void function ECAM_CollapseAll( entity player )
+{
+	EcamCollapseAllNodes( EcamGetState( player ) )
+}
+
+void function EcamCollapseAllNodes( EcamPlayerState state )
+{
+	foreach ( int id, EcamNode node in state.nodes )
+	{
+		if ( node.collapsed || node.children.len() == 0 )
+			continue
+		node.collapsed = true
+		state.dirty = true
+	}
+}
+
 void function ECAM_Delete( entity player, int index )
 {
 	if ( index == 0 )
@@ -368,6 +386,8 @@ void function ECAM_SetInteractive( entity player, bool interactive )
 	if ( state.interactive == interactive )
 		return
 	state.interactive = interactive
+	if ( !interactive )
+		EcamCollapseAllNodes( state )	// closing the panel folds every open submenu
 	state.dirty = true
 }
 
@@ -579,7 +599,7 @@ string function EcamRenderFrame( EcamPlayerState state )
 
 	EcamRow titleRow = { ... }
 	titleRow.title = true
-	EcamAppendSeg( titleRow, state.interactive ? "ECAM  交互 W/S移动 D执行 A折叠 长按E退出" : "ECAM", "" )
+	EcamAppendSeg( titleRow, state.interactive ? "ECAM  W/S移动 D执行 A折叠 长按E退出" : "ECAM", "" )
 	rows.append( titleRow )
 
 	array<EcamRow> nodeRows = []
